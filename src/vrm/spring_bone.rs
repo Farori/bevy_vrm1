@@ -27,6 +27,41 @@ pub(crate) struct SpringJointState {
 }
 
 impl SpringJointState {
+    /// Seeds the simulation state of one joint from the rest pose.
+    ///
+    /// The load-time pipeline (`vrm::gltf::handler::scene::build_spring_chains`)
+    /// builds the chains while the glTF file loads, where the scene is still in
+    /// its rest pose and every rest transform is known, so the state is
+    /// initialised right there and the runtime systems never have to.
+    ///
+    /// * `bone_axis` — the direction from the joint to the next one, in the
+    ///   joint's own rest frame. The caller passes it already normalised
+    ///   (`Vec3::normalize_or_zero`), because a zero-length bone axis would make
+    ///   the Verlet step produce `NaN`.
+    /// * `bone_length` — the distance to the next joint; the simulation keeps it
+    ///   constant.
+    /// * `tail` — the next joint's rest position, in center space when the
+    ///   spring declares a center node and in world space otherwise. This is
+    ///   both `current_tail` and `prev_tail`, i.e. the chain starts at rest with
+    ///   no inertia.
+    /// * `rest` — the joint's own rest transform, which the solver needs as the
+    ///   reference its delta rotation is applied to.
+    pub(crate) fn from_rest(
+        bone_axis: Vec3,
+        bone_length: f32,
+        tail: Vec3,
+        rest: Transform,
+    ) -> Self {
+        Self {
+            prev_tail: tail,
+            current_tail: tail,
+            bone_axis,
+            bone_length,
+            initial_local_matrix: rest.to_matrix(),
+            initial_local_rotation: rest.rotation,
+        }
+    }
+
     /// Resets the velocity by setting `prev_tail` to `current_tail`.
     ///
     /// This eliminates the inertia term `(current_tail - prev_tail)` in
