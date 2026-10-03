@@ -76,18 +76,58 @@ pub struct Spring {
 }
 
 /// The node of a single glTF with spring bone settings.
+///
+/// Every property but `node` is optional in the specification and carries a
+/// documented default. An absent property is materialised as `Some(default)`
+/// rather than left as `None`, because the consumer
+/// ([`crate::vrm::spring_bone::registry::SpringJointPropsRegistry`]) reads all
+/// five through `Option`, and a single `None` makes it discard the joint
+/// entirely — a hair strand that stops simulating because the exporter left
+/// out `stiffness`. An explicit `null` is not a valid `number` in the schema
+/// and still yields `None`.
 #[derive(Serialize, Deserialize, Copy, Clone, Debug)]
 pub struct SpringJoint {
     pub node: usize,
-    #[serde(rename = "dragForce")]
+    /// The specification default is `0.5`.
+    #[serde(rename = "dragForce", default = "default_drag_force")]
     pub drag_force: Option<f32>,
-    #[serde(rename = "gravityDir")]
+    /// The specification default is `[0.0, -1.0, 0.0]`.
+    #[serde(rename = "gravityDir", default = "default_gravity_dir")]
     pub gravity_dir: Option<[f32; 3]>,
-    #[serde(rename = "gravityPower")]
+    /// The specification default is `0.0`.
+    #[serde(rename = "gravityPower", default = "default_gravity_power")]
     pub gravity_power: Option<f32>,
-    #[serde(rename = "hitRadius")]
+    /// The specification default is `0.0`.
+    #[serde(rename = "hitRadius", default = "default_hit_radius")]
     pub hit_radius: Option<f32>,
+    /// The specification default is `1.0`.
+    #[serde(default = "default_stiffness")]
     pub stiffness: Option<f32>,
+}
+
+/// `VRMC_springBone.joints[*].dragForce` defaults to `0.5`.
+fn default_drag_force() -> Option<f32> {
+    Some(0.5)
+}
+
+/// `VRMC_springBone.joints[*].gravityDir` defaults to `[0.0, -1.0, 0.0]`.
+fn default_gravity_dir() -> Option<[f32; 3]> {
+    Some([0.0, -1.0, 0.0])
+}
+
+/// `VRMC_springBone.joints[*].gravityPower` defaults to `0.0`.
+fn default_gravity_power() -> Option<f32> {
+    Some(0.0)
+}
+
+/// `VRMC_springBone.joints[*].hitRadius` defaults to `0.0`.
+fn default_hit_radius() -> Option<f32> {
+    Some(0.0)
+}
+
+/// `VRMC_springBone.joints[*].stiffness` defaults to `1.0`.
+fn default_stiffness() -> Option<f32> {
+    Some(1.0)
 }
 
 /// The shape of the collision detection for [Collider]
@@ -145,24 +185,40 @@ impl ColliderShape {
     }
 }
 
+/// Every property of `sphere` is optional in the specification and carries a
+/// default, so an empty object is a sphere of radius zero at the node origin.
 #[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Component, Reflect, Default)]
 #[reflect(Component, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Sphere {
     /// Local coordinate of the sphere center
+    ///
+    /// The specification default is `[0.0, 0.0, 0.0]`.
     pub offset: [f32; 3],
     /// Radius of the sphere
+    ///
+    /// The specification default is `0.0`.
     pub radius: f32,
 }
 
 /// Capsule collider shape.
+///
+/// Every property is optional in the specification and carries a default.
 #[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Component, Reflect, Default)]
 #[reflect(Component, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Capsule {
     /// Local coordinate of the center of the half sphere at the start point of the capsule
+    ///
+    /// The specification default is `[0.0, 0.0, 0.0]`.
     pub offset: [f32; 3],
     /// Radius of the half sphere and cylinder part of the capsule
+    ///
+    /// The specification default is `0.0`.
     pub radius: f32,
     /// Local coordinate of the center of the half sphere at the end point of the capsule
+    ///
+    /// The specification default is `[0.0, 0.0, 0.0]`.
     pub tail: [f32; 3],
 }
 
@@ -170,7 +226,9 @@ pub struct Capsule {
 mod tests {
     use crate::success;
     use crate::tests::TestResult;
-    use crate::vrm::gltf::extensions::vrmc_spring_bone::VRMCSpringBone;
+    use crate::vrm::gltf::extensions::vrmc_spring_bone::{
+        Capsule, ColliderShape, Sphere, SpringJoint, VRMCSpringBone,
+    };
 
     #[test]
     fn deserialize_vrmc_spring_bone() -> TestResult {
@@ -198,6 +256,108 @@ mod tests {
             r#"{"specVersion":"1.0","springs":null}"#,
         ] {
             assert!(serde_json::from_str::<VRMCSpringBone>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn spring_joint_takes_the_specification_defaults_for_omitted_properties() -> TestResult {
+        // Every property of a joint but `node` is optional, and the consumer
+        // discards a joint whose properties are not all present.
+        let spring_bone: VRMCSpringBone =
+            serde_json::from_str(r#"{"specVersion":"1.0","springs":[{"joints":[{"node":3}]}]}"#)?;
+        let joint = &spring_bone.springs[0].joints[0];
+
+        assert_eq!(joint.node, 3);
+        assert_eq!(joint.drag_force, Some(0.5));
+        assert_eq!(joint.gravity_dir, Some([0.0, -1.0, 0.0]));
+        assert_eq!(joint.gravity_power, Some(0.0));
+        assert_eq!(joint.hit_radius, Some(0.0));
+        assert_eq!(joint.stiffness, Some(1.0));
+
+        success!()
+    }
+
+    #[test]
+    fn spring_joint_keeps_the_values_of_a_partially_specified_joint() -> TestResult {
+        let spring_bone: VRMCSpringBone = serde_json::from_str(
+            r#"{"specVersion":"1.0","springs":[{"joints":[{"node":3,"stiffness":0.75}]}]}"#,
+        )?;
+        let joint = &spring_bone.springs[0].joints[0];
+
+        assert_eq!(joint.stiffness, Some(0.75));
+        assert_eq!(joint.drag_force, Some(0.5));
+        assert_eq!(joint.gravity_dir, Some([0.0, -1.0, 0.0]));
+        assert_eq!(joint.gravity_power, Some(0.0));
+        assert_eq!(joint.hit_radius, Some(0.0));
+
+        success!()
+    }
+
+    #[test]
+    fn reject_spring_joint_without_a_node() {
+        assert!(
+            serde_json::from_str::<SpringJoint>(r#"{"stiffness":1.0}"#).is_err(),
+            "`node` is required"
+        );
+        assert!(serde_json::from_str::<SpringJoint>(r#"{}"#).is_err());
+    }
+
+    #[test]
+    fn spring_takes_the_specification_defaults_for_omitted_properties() -> TestResult {
+        let spring_bone: VRMCSpringBone =
+            serde_json::from_str(r#"{"specVersion":"1.0","springs":[{"joints":[{"node":3}]}]}"#)?;
+        let spring = &spring_bone.springs[0];
+
+        assert_eq!(spring.name, "");
+        assert!(spring.collider_groups.is_none());
+        assert!(spring.center.is_none());
+
+        success!()
+    }
+
+    #[test]
+    fn reject_spring_without_joints() {
+        for invalid in [
+            r#"{"specVersion":"1.0","springs":[{}]}"#,
+            r#"{"specVersion":"1.0","springs":[{"joints":null}]}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<VRMCSpringBone>(invalid).is_err(),
+                "`joints` is required"
+            );
+        }
+    }
+
+    #[test]
+    fn collider_shape_takes_the_specification_defaults_for_omitted_properties() -> TestResult {
+        // Every property of `sphere` and `capsule` is optional.
+        let sphere: ColliderShape = serde_json::from_str(r#"{"sphere":{}}"#)?;
+        assert_eq!(sphere, ColliderShape::Sphere(Sphere::default()));
+        assert_eq!(sphere.radius(), 0.0);
+
+        let capsule: ColliderShape = serde_json::from_str(r#"{"capsule":{}}"#)?;
+        assert_eq!(capsule, ColliderShape::Capsule(Capsule::default()));
+        assert_eq!(capsule.radius(), 0.0);
+
+        let offset: ColliderShape = serde_json::from_str(r#"{"sphere":{"radius":0.5}}"#)?;
+        assert_eq!(
+            offset,
+            ColliderShape::Sphere(Sphere {
+                offset: [0.0; 3],
+                radius: 0.5
+            })
+        );
+
+        success!()
+    }
+
+    #[test]
+    fn reject_collider_shape_with_neither_sphere_nor_capsule() {
+        for invalid in [r#"{}"#, r#"{"box":{}}"#] {
+            assert!(
+                serde_json::from_str::<ColliderShape>(invalid).is_err(),
+                "`oneOf` requires exactly one shape"
+            );
         }
     }
 }
