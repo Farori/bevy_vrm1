@@ -9,6 +9,7 @@
 
 mod bones;
 
+use crate::error::vrm_warn;
 use crate::prelude::*;
 use crate::vrm::gltf::extensions::VrmNode;
 use crate::vrm::humanoid_bone::bones::BonesPlugin;
@@ -132,14 +133,22 @@ fn apply_initialize_humanoid_bones(
     parents: Query<&ChildOf>,
     transforms: Query<(&Transform, &GlobalTransform)>,
     has_vrm: Query<Has<Vrm>>,
+    names: Query<&Name>,
 ) {
     let model_entity = trigger.event_target();
     let Ok(registry) = models.get(model_entity) else {
         return;
     };
-    let Some(hips) =
-        searcher.find_from_name(model_entity, registry.get(&VrmBone::from("hips")).unwrap())
-    else {
+    let Some(hips_name) = registry.get(&VrmBone::from("hips")) else {
+        let name = names
+            .get(model_entity)
+            .map_or("unnamed", |name| name.as_str());
+        vrm_warn!(
+            "[VRM] Skipping humanoid bone initialization, `hips` bone is not declared ({name}, {model_entity:?})"
+        );
+        return;
+    };
+    let Some(hips) = searcher.find_from_name(model_entity, hips_name.as_str()) else {
         return;
     };
     let Ok(ChildOf(root_bone)) = parents.get(hips) else {
@@ -243,6 +252,93 @@ fn apply_initialize_humanoid_bones(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::success;
+    use crate::tests::{TestResult, test_app};
+
+    /// Builds `model -> root_bone -> bone nodes` and registers the humanoid bone observer.
+    fn model_with_bones(
+        app: &mut App,
+        registry: HumanoidBoneRegistry,
+        bones: &[&'static str],
+    ) -> (Entity, Entity) {
+        app.add_observer(apply_initialize_humanoid_bones);
+        let model = app
+            .world_mut()
+            .spawn((Name::new("TestModel"), registry, Vrm))
+            .with_children(|children| {
+                children
+                    .spawn(Name::new(Vrm::ROOT_BONE))
+                    .with_children(|children| {
+                        for name in bones {
+                            children.spawn((
+                                Name::new(*name),
+                                Transform::default(),
+                                GlobalTransform::IDENTITY,
+                            ));
+                        }
+                    });
+            })
+            .id();
+        let root_bone = app.world().get::<Children>(model).unwrap()[0];
+        (model, root_bone)
+    }
+
+    /// A VRM declaring a `hips` humanoid bone still initializes as before.
+    #[test]
+    fn declared_hips_bone_is_initialized() -> TestResult {
+        let mut app = test_app();
+        let registry = HumanoidBoneRegistry(
+            [
+                (VrmBone::from("hips"), Name::new("J_Bip_C_Hips")),
+                (VrmBone::from("spine"), Name::new("J_Bip_C_Spine")),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let (model, root_bone) =
+            model_with_bones(&mut app, registry, &["J_Bip_C_Hips", "J_Bip_C_Spine"]);
+
+        app.world_mut()
+            .trigger(RequestInitializeHumanoidBones(model));
+        app.world_mut().flush();
+
+        let hips = app.world().get::<HipsBoneEntity>(model).unwrap().0;
+        assert!(app.world().get::<Hips>(hips).is_some());
+        assert_eq!(
+            app.world().get::<RestTransform>(hips).unwrap().0,
+            Transform::default()
+        );
+        assert!(app.world().get::<AnimationPlayer>(root_bone).is_some());
+        assert!(app.world().get::<SpineBoneEntity>(model).is_some());
+        success!()
+    }
+
+    /// A loadable but malformed VRM that declares no `hips` bone is skipped instead of
+    /// panicking. Used to abort on `registry.get(&VrmBone::from("hips")).unwrap()`.
+    #[test]
+    fn missing_hips_bone_is_skipped() -> TestResult {
+        let mut app = test_app();
+        let registry = HumanoidBoneRegistry(
+            [(VrmBone::from("spine"), Name::new("J_Bip_C_Spine"))]
+                .into_iter()
+                .collect(),
+        );
+        let (model, root_bone) = model_with_bones(&mut app, registry, &["J_Bip_C_Spine"]);
+
+        app.world_mut()
+            .trigger(RequestInitializeHumanoidBones(model));
+        app.world_mut().flush();
+
+        // Initialization was skipped as a whole, so no marker and no rest pose exist.
+        assert!(app.world().get::<HipsBoneEntity>(model).is_none());
+        assert!(app.world().get::<SpineBoneEntity>(model).is_none());
+        assert!(app.world().get::<AnimationPlayer>(root_bone).is_none());
+        let spine = app.world().get::<Children>(root_bone).unwrap()[0];
+        assert!(app.world().get::<Spine>(spine).is_none());
+        assert!(app.world().get::<RestTransform>(spine).is_none());
+        assert!(app.world().get::<RestGlobalTransform>(spine).is_none());
+        success!()
+    }
 
     #[test]
     fn snapshots_descendants_including_leaf_nodes_and_model_placement() {
