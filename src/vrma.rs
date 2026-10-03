@@ -14,6 +14,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 pub mod prelude {
+    // `ExpressionCategory` is a `vrm` concept that `vrm::prelude` does not
+    // export yet; it is re-exported here because
+    // [`ExpressionSetting`](crate::vrma::animation::properties::ExpressionSetting)
+    // is public API and stores one per expression.
+    pub use crate::vrm::expressions::ExpressionCategory;
     pub use crate::vrma::{
         LoadedVrma, Vrma, VrmaDuration, VrmaEntity, VrmaHandle, VrmaPath, VrmaPlugin,
         animation::prelude::*, loader::VrmaAsset,
