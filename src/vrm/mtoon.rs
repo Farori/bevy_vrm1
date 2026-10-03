@@ -4,7 +4,7 @@ mod setup;
 
 use crate::error::vrm_error;
 use crate::prelude::*;
-use crate::vrm::gltf::materials::VrmcMaterialsExtensitions;
+use crate::vrm::gltf::materials::{VrmcMaterialsExtensitions, VrmcMaterialsHdrEmissiveMultiplier};
 use crate::vrm::mtoon::outline_pass::MToonOutlinePlugin;
 use crate::vrm::mtoon::setup::MToonMaterialSetupPlugin;
 use bevy::asset::{AssetId, load_internal_asset, uuid_handle};
@@ -63,6 +63,12 @@ impl Plugin for MtoonMaterialPlugin {
 pub struct VrmcMaterialRegistry {
     pub images: Vec<Handle<Image>>,
     pub materials: HashMap<AssetId<StandardMaterial>, VrmcMaterialsExtensitions>,
+    /// The `VRMC_materials_hdr_emissiveMultiplier` of each material that
+    /// declares the extension.
+    ///
+    /// Materials without the extension are absent, which means a multiplier
+    /// of `1.0`. See [`VrmcMaterialRegistry::hdr_emissive_multiplier`].
+    pub hdr_emissive_multipliers: HashMap<AssetId<StandardMaterial>, f32>,
 }
 
 impl VrmcMaterialRegistry {
@@ -72,6 +78,21 @@ impl VrmcMaterialRegistry {
         asset_server: &AssetServer,
     ) -> Self {
         Self::try_new(gltf, images, asset_server).unwrap_or_default()
+    }
+
+    /// The multiplier for the emissive factor of the material.
+    ///
+    /// Returns `1.0` for a material without the
+    /// `VRMC_materials_hdr_emissiveMultiplier` extension, or one that declares
+    /// it malformed.
+    pub fn hdr_emissive_multiplier(
+        &self,
+        id: AssetId<StandardMaterial>,
+    ) -> f32 {
+        self.hdr_emissive_multipliers
+            .get(&id)
+            .copied()
+            .unwrap_or(1.0)
     }
 
     fn try_new(
@@ -86,26 +107,48 @@ impl VrmcMaterialRegistry {
         // name, so duplicates collapse to a single entry and any meshes bound
         // to the overwritten materials skip the MToon conversion entirely,
         // rendering with the default `StandardMaterial` instead.
-        let materials = gltf
-            .source
-            .as_ref()?
-            .materials()
-            .flat_map(|m| {
-                let index = m.index()?;
-                let gltf_material_path = gltf.materials.get(index)?.path()?;
-                let std_label = format!("{}/std", gltf_material_path.label()?);
-                let std_path = gltf_material_path.clone().with_label(std_label);
-                let asset_id = asset_server.load::<StandardMaterial>(std_path).id();
-                let extensions = m.extensions()?;
-                match serde_json::from_value(extensions.get("VRMC_materials_mtoon")?.clone()) {
-                    Ok(properties) => Some((asset_id, properties)),
-                    Err(e) => {
-                        vrm_error!("Failed to parse VRMC_materials_mtoon", e);
-                        None
-                    }
+        let mut materials = HashMap::new();
+        let mut hdr_emissive_multipliers = HashMap::new();
+        for material in gltf.source.as_ref()?.materials() {
+            let Some(index) = material.index() else {
+                continue;
+            };
+            let Some(gltf_material_path) = gltf.materials.get(index).and_then(|m| m.path()) else {
+                continue;
+            };
+            let Some(std_label) = gltf_material_path.label() else {
+                continue;
+            };
+            let std_path = gltf_material_path
+                .clone()
+                .with_label(format!("{std_label}/std"));
+            let asset_id = asset_server.load::<StandardMaterial>(std_path).id();
+            let Some(extensions) = material.extensions() else {
+                continue;
+            };
+            let Some(mtoon) = extensions.get("VRMC_materials_mtoon") else {
+                continue;
+            };
+            match serde_json::from_value(mtoon.clone()) {
+                Ok(properties) => {
+                    materials.insert(asset_id, properties);
                 }
-            })
-            .collect();
-        Some(Self { materials, images })
+                Err(e) => {
+                    vrm_error!("Failed to parse VRMC_materials_mtoon", e);
+                }
+            }
+            // The emissive multiplier is a separate extension from the MToon
+            // one, so it applies even when `VRMC_materials_mtoon` is malformed.
+            if let Some(multiplier) =
+                VrmcMaterialsHdrEmissiveMultiplier::from_material_extensions(extensions)
+            {
+                hdr_emissive_multipliers.insert(asset_id, multiplier.emissive_strength);
+            }
+        }
+        Some(Self {
+            materials,
+            images,
+            hdr_emissive_multipliers,
+        })
     }
 }

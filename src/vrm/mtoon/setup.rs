@@ -78,7 +78,11 @@ fn turn_to_mtoon_material(
                     opaque_renderer_method: base.opaque_render_method,
                     base_color: base.base_color,
                     cull_mode: base.cull_mode,
-                    emissive: base.emissive,
+                    // `base.emissive` is the glTF `emissiveFactor` already
+                    // scaled by `KHR_materials_emissive_strength`; MToon needs
+                    // one more multiplication with the VRM HDR multiplier,
+                    // which is absent in most avatars and means `1.0`.
+                    emissive: base.emissive * registry.hdr_emissive_multiplier(handle.id()),
                     emissive_texture: base.emissive_texture.clone(),
                     uv_transform: base.uv_transform,
                 }),
