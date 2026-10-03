@@ -1,4 +1,6 @@
 pub mod body_tracking;
+pub mod components;
+pub mod coords;
 pub mod detach;
 pub(crate) mod expressions;
 pub(crate) mod first_person;
@@ -36,6 +38,14 @@ pub mod prelude {
         Initialized, RestGlobalTransform, RestTransform, RestWorldTransform, Vrm, VrmBone,
         VrmExpression, VrmPath, VrmPlugin,
         body_tracking::{BodyTracking, SmoothedGaze},
+        components::{
+            ConstraintExecutionOrder, LAYER_BOTH, LAYER_FIRST_PERSON_ONLY, LAYER_THIRD_PERSON_ONLY,
+            PendingNodeConstraint, VrmConstraintKind, VrmHeadOnly, VrmLightLayersPlugin,
+            VrmNodeConstraint, VrmNodeIndex, all_vrm_render_layers, both_view_mesh_layers,
+            first_person_camera_layers, first_person_only_mesh_layers, third_person_camera_layers,
+            third_person_only_mesh_layers, vrm_light_layers_for, widen_vrm_light_layers,
+        },
+        coords::{VrmForwardPolicy, resolve_forward_policy},
         detach::RequestDetachVrm,
         expressions::{
             BinaryExpression, ClearExpressions, EffectiveExpressionWeight, ExpressionEntityMap,
