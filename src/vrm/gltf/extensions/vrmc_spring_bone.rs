@@ -34,7 +34,8 @@ impl VRMCSpringBone {
     ) -> Vec<Collider> {
         collider_group_indices
             .iter()
-            .flat_map(|index| self.collider_groups[*index].colliders.clone())
+            .filter_map(|index| self.collider_groups.get(*index))
+            .flat_map(|group| group.colliders.clone())
             .flat_map(|index| self.colliders.get(index as usize).cloned())
             .collect()
     }
@@ -61,6 +62,7 @@ pub struct Collider {
 #[derive(Serialize, Deserialize)]
 pub struct Spring {
     /// Spring name
+    #[serde(default)]
     pub name: String,
 
     /// The list of joints that make up the springBone.
@@ -152,7 +154,7 @@ pub struct Sphere {
     pub radius: f32,
 }
 
-/// 楕円形の
+/// Capsule collider shape.
 #[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Component, Reflect, Default)]
 #[reflect(Component, Serialize, Deserialize)]
 pub struct Capsule {
