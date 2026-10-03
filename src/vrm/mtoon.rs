@@ -137,12 +137,15 @@ impl VrmcMaterialRegistry {
                     vrm_error!("Failed to parse VRMC_materials_mtoon", e);
                 }
             }
-            // The emissive multiplier is a separate extension from the MToon
-            // one, so it applies even when `VRMC_materials_mtoon` is malformed.
+            // The emissive multiplier is a separate *material* extension, so it
+            // is read from the same `extensions` map and is independent of the
+            // shape of the `VRMC_materials_mtoon` block next to it. Only
+            // `MToonMaterialSetupPlugin` reads the value back, so a material
+            // without a parseable MToon block never reaches it.
             if let Some(multiplier) =
                 VrmcMaterialsHdrEmissiveMultiplier::from_material_extensions(extensions)
             {
-                hdr_emissive_multipliers.insert(asset_id, multiplier.emissive_strength);
+                hdr_emissive_multipliers.insert(asset_id, multiplier.emissive_multiplier);
             }
         }
         Some(Self {
@@ -150,5 +153,72 @@ impl VrmcMaterialRegistry {
             images,
             hdr_emissive_multipliers,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::success;
+    use crate::tests::TestResult;
+
+    #[test]
+    fn hdr_emissive_multiplier_defaults_to_the_identity() -> TestResult {
+        let mut registry = VrmcMaterialRegistry::default();
+        let declared = registry.materials.len();
+        assert_eq!(declared, 0);
+
+        // A material that does not declare the extension is absent from the
+        // map, which reads back as the identity so `bevy_gltf`'s
+        // `KHR_materials_emissive_strength` result survives untouched.
+        let id = AssetId::default();
+        assert_eq!(registry.hdr_emissive_multiplier(id), 1.0);
+
+        registry.hdr_emissive_multipliers.insert(
+            id,
+            VrmcMaterialsHdrEmissiveMultiplier::default().emissive_multiplier,
+        );
+        assert_eq!(registry.hdr_emissive_multiplier(id), 1.0);
+
+        registry.hdr_emissive_multipliers.insert(id, 2.5);
+        assert_eq!(registry.hdr_emissive_multiplier(id), 2.5);
+
+        success!()
+    }
+
+    #[test]
+    fn hdr_emissive_multiplier_composes_with_khr_emissive_strength() -> TestResult {
+        // `bevy_gltf` (`crates/bevy_gltf/src/loader/mod.rs:1414-1415`) computes
+        //     StandardMaterial::emissive = emissiveFactor * KHR_strength
+        // and `MToonMaterialSetupPlugin` (`src/vrm/mtoon/setup.rs`) computes
+        //     MToonMaterial::emissive   = StandardMaterial::emissive * VRM_multiplier
+        // so the two extensions multiply exactly once each.
+        let factors = [
+            // (emissiveFactor, KHR_materials_emissive_strength, VRMC multiplier)
+            (1.0, 1.0, 1.0),
+            (0.5, 4.0, 2.0),
+            (1.0, 1.0, 10.0),
+        ];
+
+        for (emissive_factor, khr_strength, vrm_multiplier) in factors {
+            let mut registry = VrmcMaterialRegistry::default();
+            let id = AssetId::default();
+            registry.hdr_emissive_multipliers.insert(id, vrm_multiplier);
+
+            let base = StandardMaterial {
+                emissive: LinearRgba::rgb(emissive_factor, emissive_factor, emissive_factor)
+                    * khr_strength,
+                ..Default::default()
+            };
+            let emissive = base.emissive * registry.hdr_emissive_multiplier(id);
+
+            assert_eq!(
+                emissive.red,
+                emissive_factor * khr_strength * vrm_multiplier,
+                "the multiplier applies once, on top of the KHR strength"
+            );
+        }
+
+        success!()
     }
 }

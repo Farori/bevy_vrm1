@@ -195,15 +195,24 @@ impl VrmcMaterialsExtensitions {
 pub struct VrmcMaterialsHdrEmissiveMultiplier {
     /// The multiplier for the emissive factor.
     ///
+    /// The property is named `emissiveMultiplier`, not `emissiveStrength`:
+    /// > | emissiveMultiplier | number | A multiplier for emissiveFactor | ? |
+    ///
+    /// `emissiveStrength` belongs to `KHR_materials_emissive_strength`, the
+    /// Khronos extension that supersedes this one and that `bevy_gltf` already
+    /// applies to the `StandardMaterial`. Reading it here would double-count it
+    /// and, because this extension is absent from most avatars, would in
+    /// practice never fire at all.
+    ///
     /// The specification default is `1.0`.
-    #[serde(rename = "emissiveStrength", default = "default_one")]
-    pub emissive_strength: f32,
+    #[serde(rename = "emissiveMultiplier", default = "default_one")]
+    pub emissive_multiplier: f32,
 }
 
 impl Default for VrmcMaterialsHdrEmissiveMultiplier {
     fn default() -> Self {
         Self {
-            emissive_strength: default_one(),
+            emissive_multiplier: default_one(),
         }
     }
 }
@@ -518,25 +527,78 @@ mod tests {
     #[test]
     fn parse_hdr_emissive_multiplier() -> TestResult {
         let extensions = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
-            r#"{"VRMC_materials_hdr_emissiveMultiplier":{"emissiveStrength":2.5}}"#,
+            r#"{"VRMC_materials_hdr_emissiveMultiplier":{"emissiveMultiplier":2.5}}"#,
         )?;
         let multiplier = VrmcMaterialsHdrEmissiveMultiplier::from_material_extensions(&extensions)
             .expect("VRMC_materials_hdr_emissiveMultiplier should be parsed");
 
-        assert_eq!(multiplier.emissive_strength, 2.5);
+        assert_eq!(multiplier.emissive_multiplier, 2.5);
 
         success!()
     }
 
     #[test]
-    fn parse_hdr_emissive_multiplier_without_emissive_strength() -> TestResult {
+    fn hdr_emissive_multiplier_is_read_from_the_material_extensions() -> TestResult {
+        // The extension is a *material* extension, so it sits next to
+        // `VRMC_materials_mtoon` and not inside it.
+        let extensions = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+            r#"{
+                "VRMC_materials_mtoon": {"specVersion": "1.0"},
+                "VRMC_materials_hdr_emissiveMultiplier": {"emissiveMultiplier": 3.0}
+            }"#,
+        )?;
+        let multiplier = VrmcMaterialsHdrEmissiveMultiplier::from_material_extensions(&extensions)
+            .expect("a sibling of VRMC_materials_mtoon is still read");
+
+        assert_eq!(multiplier.emissive_multiplier, 3.0);
+
+        // Nested inside the MToon extension it is not an extension of the
+        // material at all, so it is not read.
+        let nested = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+            r#"{
+                "VRMC_materials_mtoon": {
+                    "specVersion": "1.0",
+                    "VRMC_materials_hdr_emissiveMultiplier": {"emissiveMultiplier": 3.0}
+                }
+            }"#,
+        )?;
+        assert!(
+            VrmcMaterialsHdrEmissiveMultiplier::from_material_extensions(&nested).is_none(),
+            "the multiplier is not a property of VRMC_materials_mtoon"
+        );
+
+        success!()
+    }
+
+    #[test]
+    fn hdr_emissive_multiplier_does_not_read_khr_emissive_strength() -> TestResult {
+        // `emissiveStrength` is the property of `KHR_materials_emissive_strength`,
+        // which `bevy_gltf` already folded into `StandardMaterial::emissive`.
+        // Reading it here as well would square the strength.
+        let extensions = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
+            r#"{"VRMC_materials_hdr_emissiveMultiplier":{"emissiveStrength":4.0}}"#,
+        )?;
+        let multiplier = VrmcMaterialsHdrEmissiveMultiplier::from_material_extensions(&extensions)
+            .expect("the extension is declared, its unknown property is just ignored");
+
+        assert_eq!(
+            multiplier.emissive_multiplier, 1.0,
+            "`emissiveStrength` belongs to KHR_materials_emissive_strength, so it must not \
+             be read as a VRM multiplier of 4.0"
+        );
+
+        success!()
+    }
+
+    #[test]
+    fn parse_hdr_emissive_multiplier_without_emissive_multiplier() -> TestResult {
         let extensions = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(
             r#"{"VRMC_materials_hdr_emissiveMultiplier":{}}"#,
         )?;
         let multiplier = VrmcMaterialsHdrEmissiveMultiplier::from_material_extensions(&extensions)
             .expect("an empty extension is tolerated");
 
-        assert_eq!(multiplier.emissive_strength, 1.0);
+        assert_eq!(multiplier.emissive_multiplier, 1.0);
         assert_eq!(
             multiplier,
             VrmcMaterialsHdrEmissiveMultiplier::default(),
@@ -559,8 +621,8 @@ mod tests {
         for malformed in [
             r#"{"VRMC_materials_hdr_emissiveMultiplier":2.0}"#,
             r#"{"VRMC_materials_hdr_emissiveMultiplier":null}"#,
-            r#"{"VRMC_materials_hdr_emissiveMultiplier":{"emissiveStrength":"2.0"}}"#,
-            r#"{"VRMC_materials_hdr_emissiveMultiplier":{"emissiveStrength":null}}"#,
+            r#"{"VRMC_materials_hdr_emissiveMultiplier":{"emissiveMultiplier":"2.0"}}"#,
+            r#"{"VRMC_materials_hdr_emissiveMultiplier":{"emissiveMultiplier":null}}"#,
         ] {
             let extensions =
                 serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(malformed)?;

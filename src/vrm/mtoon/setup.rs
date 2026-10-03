@@ -79,9 +79,16 @@ fn turn_to_mtoon_material(
                     base_color: base.base_color,
                     cull_mode: base.cull_mode,
                     // `base.emissive` is the glTF `emissiveFactor` already
-                    // scaled by `KHR_materials_emissive_strength`; MToon needs
-                    // one more multiplication with the VRM HDR multiplier,
-                    // which is absent in most avatars and means `1.0`.
+                    // multiplied by `KHR_materials_emissive_strength`, which
+                    // `bevy_gltf` applies in
+                    // `crates/bevy_gltf/src/loader/mod.rs:1414-1415` while
+                    // loading the `StandardMaterial`. MToon needs the one
+                    // remaining multiplication from
+                    // `VRMC_materials_hdr_emissiveMultiplier` ("Overwrite
+                    // material.emissiveFactor of the target material with the
+                    // value multiplied by emissiveMultiplier"), and it is
+                    // applied here exactly once. The extension is absent from
+                    // most avatars, which `hdr_emissive_multiplier` reads as `1.0`.
                     emissive: base.emissive * registry.hdr_emissive_multiplier(handle.id()),
                     emissive_texture: base.emissive_texture.clone(),
                     uv_transform: base.uv_transform,
