@@ -1,11 +1,10 @@
 use crate::vrm::Vrm;
-use crate::vrma::Vrma;
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 
 #[derive(SystemParam)]
 pub struct ParentSearcher<'w, 's> {
-    entities: Query<'w, 's, (Option<&'static ChildOf>, Has<Vrm>, Has<Vrma>)>,
+    entities: Query<'w, 's, (Option<&'static ChildOf>, Has<Vrm>)>,
 }
 
 impl ParentSearcher<'_, '_> {
@@ -14,25 +13,21 @@ impl ParentSearcher<'_, '_> {
         &self,
         source: Entity,
     ) -> Option<Entity> {
-        find_entity(true, source, &self.entities)
+        find_entity(source, &self.entities)
     }
 }
 
-#[allow(clippy::if_same_then_else)]
 fn find_entity(
-    require_vrm: bool,
     entity: Entity,
-    entities: &Query<(Option<&ChildOf>, Has<Vrm>, Has<Vrma>)>,
+    entities: &Query<(Option<&ChildOf>, Has<Vrm>)>,
 ) -> Option<Entity> {
-    let (child_of, has_vrm, has_vrma) = entities.get(entity).ok()?;
+    let (child_of, has_vrm) = entities.get(entity).ok()?;
 
-    if require_vrm && has_vrm {
-        return Some(entity);
-    } else if !require_vrm && has_vrma {
+    if has_vrm {
         return Some(entity);
     }
     if let Some(parent) = child_of {
-        return find_entity(require_vrm, parent.0, entities);
+        return find_entity(parent.0, entities);
     }
     None
 }
