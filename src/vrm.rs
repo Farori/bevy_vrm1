@@ -11,6 +11,7 @@ mod loader;
 mod look_at;
 mod mtoon;
 mod node_constraint;
+pub(crate) mod runtime;
 pub mod spring_bone;
 
 use crate::macros::marker_component;
