@@ -1,5 +1,16 @@
-//! This library extends the original shader to support multiple directional lights.
+//! This example shows multiple directional lights on one VRM model: one circles
+//! the avatar and one swings back and forth.
+//!
+//! Neither light sets `RenderLayers` on purpose, which makes them a worked
+//! example of `VrmLightLayersPlugin` - added here, because neither `VrmPlugin`
+//! nor `VrmGltfPlugin` adds it. A light that carries no render layers at all, or
+//! the default `{0}`, is widened to `all_vrm_render_layers`: bevy drops a mesh
+//! from a light's shadow map when the two layer sets do not intersect, and
+//! `VRMC_vrm.firstPerson` puts the head meshes that `auto` splits off on the
+//! exclusive layer 1. A light whose layers are set explicitly is left exactly as
+//! it is, so such a light has to include layers 1 and 2 itself.
 
+use bevy::gltf::GltfAssetLabel;
 use bevy::prelude::*;
 use bevy_vrm1::prelude::*;
 
@@ -11,7 +22,12 @@ struct RotateArc;
 
 fn main() {
     App::new()
-        .add_plugins((DefaultPlugins, VrmPlugin))
+        .add_plugins((
+            DefaultPlugins,
+            VrmPlugin,
+            VrmGltfPlugin,
+            VrmLightLayersPlugin,
+        ))
         .add_systems(Startup, (spawn_camera, spawn_vrm, spawn_directional_light))
         .add_systems(Update, (rotate_circle, rotate_arc))
         .run();
@@ -42,7 +58,12 @@ fn spawn_camera(
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
 ) {
-    commands.spawn((Camera3d::default(), Transform::from_xyz(0.0, 2.5, 3.5)));
+    commands.spawn((
+        Camera3d::default(),
+        // A default camera does not render the exclusive first-person layers.
+        third_person_camera_layers(),
+        Transform::from_xyz(0.0, 2.5, 3.5),
+    ));
     // Ground
     commands.spawn((
         Mesh3d(meshes.add(Plane3d::new(Vec3::Y, Vec2::new(1000.0, 1000.0)))),
@@ -60,7 +81,9 @@ fn spawn_vrm(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
 ) {
-    commands.spawn(VrmHandle(asset_server.load("vrm/AliciaSolid.vrm")));
+    commands.spawn(WorldAssetRoot(
+        asset_server.load(GltfAssetLabel::Scene(0).from_asset("vrm/AliciaSolid.vrm")),
+    ));
 }
 
 fn rotate_circle(
