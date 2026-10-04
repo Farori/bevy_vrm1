@@ -436,6 +436,13 @@ mod tests {
     /// (`Assets<Shader>`, and more beyond) that a headless `cargo test` app has
     /// no business providing. `build` calls it unconditionally, on the last
     /// line.
+    ///
+    /// What the assertion covers is the *whole* path the load-time shape has
+    /// left: the weights sit on the root, and this pass is the only thing that
+    /// moves them, so one weight written on the root is one morph slot driven on
+    /// the mesh with no intermediate entity. Which `.vrma` expression curves
+    /// reach that root component is a separate question, answered by
+    /// [`retarget_expression_curves`](crate::vrma::animation::expressions::retarget_expression_curves).
     #[test]
     fn the_pipeline_expression_binds_are_applied_by_the_schedule() -> TestResult {
         let mut app = test_app();
@@ -473,16 +480,6 @@ mod tests {
 
         let morph = app.world().get::<MorphWeights>(mesh).unwrap();
         assert_eq!(morph.weights(), &[0.0, 0.5]);
-        // The pass is the only morph-weight writer: the weights reach the mesh
-        // through one ordered system, with no per-expression entity in between.
-        let mut names = app.world_mut().query::<&Name>();
-        let expression_tree = names
-            .iter(app.world())
-            .any(|name| name.as_str() == Vrm::EXPRESSIONS_ROOT);
-        assert!(
-            !expression_tree,
-            "expression weights live on the root; there is no per-expression subtree"
-        );
         success!()
     }
 }

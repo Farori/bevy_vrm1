@@ -26,7 +26,6 @@ use bevy::math::{Mat4, Quat, Vec3};
 use bevy::platform::collections::hash_map::Entry;
 use bevy::platform::collections::{HashMap, HashSet};
 use bevy::prelude::*;
-use serde::Deserialize;
 use std::sync::Arc;
 
 use super::VrmLoadState;
@@ -38,13 +37,6 @@ use crate::vrm::gltf::extensions::vrmc_vrm::VrmcVrm;
 pub const EXT_VRMC_VRM: &str = "VRMC_vrm";
 /// The spring-bone extension, `VRMC_springBone-1.0`.
 pub const EXT_VRMC_SPRING_BONE: &str = "VRMC_springBone";
-/// The animation-file extension, `VRMC_vrm_animation-1.0`. Declared for the
-/// `.vrma` commit; never read as a model root, see the module docs.
-#[allow(
-    dead_code,
-    reason = "read by the .vrma commit, which owns the VRMC_vrm_animation hook"
-)]
-pub const EXT_VRMC_VRM_ANIMATION: &str = "VRMC_vrm_animation";
 /// The node extension, `VRMC_node_constraint-1.0`.
 pub const EXT_NODE_CONSTRAINT: &str = "VRMC_node_constraint";
 
@@ -426,87 +418,6 @@ fn uniform_root_scale(gltf: &gltf::Gltf) -> f32 {
     scale.x
 }
 
-// ---------------------------------------------------------------------------
-// `VRMC_vrm_animation-1.0`
-// ---------------------------------------------------------------------------
-
-/// `VRMC_vrm_animation`, the root extension of a `.vrma` file.
-///
-/// The VRMA commit parses this in `on_root` and reads it again from
-/// `on_animation` (which receives no document, hence the raw GLB BIN chunk in
-/// the load state). It is declared here, next to the other root schemas, and
-/// exercised by the tests below so that the shape is pinned before it is used.
-///
-/// Only the parts that *differ* from `VRMC_vrm` are modelled: `humanoid` is
-/// shared with [`VrmcVrm`], while `expressions` holds node references instead of
-/// expression definitions.
-#[allow(
-    dead_code,
-    reason = "consumed by the .vrma commit, which adds on_animation/on_animations_collected"
-)]
-#[derive(Deserialize, Clone, Debug, Default)]
-#[serde(rename_all = "camelCase", default)]
-pub struct VrmcVrmAnimation {
-    /// `VRMC_vrm_animation.specVersion`, fixed to `"1.0"`.
-    pub spec_version: String,
-    /// The humanoid bone map, identical in shape to `VRMC_vrm.humanoid`.
-    pub humanoid: VrmaHumanoid,
-    /// The expression node references.
-    pub expressions: Option<VrmaExpressions>,
-    /// The look-at target node.
-    pub look_at: Option<VrmaLookAt>,
-}
-
-/// `VRMC_vrm_animation.humanoid`.
-#[allow(dead_code, reason = "see `VrmcVrmAnimation`")]
-#[derive(Deserialize, Clone, Debug, Default)]
-#[serde(rename_all = "camelCase", default)]
-pub struct VrmaHumanoid {
-    /// Bone name -> the glTF node index the bone is bound to.
-    pub human_bones: HashMap<String, VrmaHumanBone>,
-}
-
-/// One `VRMC_vrm_animation.humanoid.humanBones` entry.
-#[allow(dead_code, reason = "see `VrmcVrmAnimation`")]
-#[derive(Deserialize, Clone, Copy, Debug, Default)]
-#[serde(rename_all = "camelCase", default)]
-pub struct VrmaHumanBone {
-    /// The glTF index of the node the bone is bound to.
-    pub node: usize,
-}
-
-/// `VRMC_vrm_animation.expressions`.
-#[allow(dead_code, reason = "see `VrmcVrmAnimation`")]
-#[derive(Deserialize, Clone, Debug, Default)]
-#[serde(rename_all = "camelCase", default)]
-pub struct VrmaExpressions {
-    /// The preset expressions.
-    pub preset: HashMap<String, VrmaExpression>,
-    /// The custom expressions.
-    pub custom: HashMap<String, VrmaExpression>,
-}
-
-/// A `VRMC_vrm_animation.expressions` entry: the *node* whose
-/// `MorphWeights` the animation drives.
-#[allow(dead_code, reason = "see `VrmcVrmAnimation`")]
-#[derive(Deserialize, Clone, Copy, Debug, Default)]
-#[serde(rename_all = "camelCase", default)]
-pub struct VrmaExpression {
-    /// The glTF index of the node carrying the morph weights.
-    pub node: usize,
-}
-
-/// `VRMC_vrm_animation.lookAt`.
-#[allow(dead_code, reason = "see `VrmcVrmAnimation`")]
-#[derive(Deserialize, Clone, Copy, Debug, Default)]
-#[serde(rename_all = "camelCase", default)]
-pub struct VrmaLookAt {
-    /// The glTF index of the look-at node.
-    pub node: usize,
-    /// The offset from the head bone, in the look-at node's space.
-    pub offset_from_head_bone: Option<[f32; 3]>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -823,36 +734,6 @@ mod tests {
 
         assert!(!state.is_vrm(), "a .vrma file is not a model");
         assert!(state.bone_nodes.is_empty());
-        success!()
-    }
-
-    #[test]
-    fn the_vrma_schema_is_the_node_reference_shape() -> TestResult {
-        let animation: VrmcVrmAnimation = serde_json::from_str(
-            r#"{
-                "specVersion": "1.0",
-                "humanoid": {"humanBones": {"hips": {"node": 7}}},
-                "expressions": {
-                    "preset": {"happy": {"node": 12}},
-                    "custom": {"Wave": {"node": 13}}
-                },
-                "lookAt": {"node": 14, "offsetFromHeadBone": [0.0, 0.1, 0.0]}
-            }"#,
-        )?;
-
-        assert_eq!(animation.humanoid.human_bones["hips"].node, 7);
-        assert_eq!(
-            animation.expressions.as_ref().unwrap().preset["happy"].node,
-            12
-        );
-        assert_eq!(
-            animation.expressions.as_ref().unwrap().custom["Wave"].node,
-            13
-        );
-        assert_eq!(
-            animation.look_at.unwrap().offset_from_head_bone,
-            Some([0.0, 0.1, 0.0])
-        );
         success!()
     }
 }

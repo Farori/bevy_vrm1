@@ -24,23 +24,49 @@
 //! When the VRMA animation player is set up, a [`LoadedVrma`] trigger is fired.
 //! You cannot play animations until this load is complete.
 //!
-//! # Known gap
+//! # Both kinds of track play
 //!
-//! The clip's *humanoid bone* tracks play: the retarget resolves the destination
-//! bone by [`VrmBone`], which the pipeline writes on every bone
+//! A `.vrma` carries two kinds of track, and on an avatar spawned by
+//! [`spawn_vrm`] both of them reach the model.
+//!
+//! The clip's *humanoid bone* tracks resolve their destination bone by
+//! [`VrmBone`], which the pipeline writes on every bone
 //! (`src/vrm/gltf/handler/nodes.rs:39`), and the animation graph, its mask
 //! groups and the `AnimationPlayer` on `Vrm::ROOT_BONE` are all built from
-//! components a pipeline scene does carry.
+//! components a pipeline scene does carry
+//! (`src/vrm/gltf/handler/scene.rs:548-593`).
 //!
-//! Its *expression* tracks do not. `VRMA_01.vrma` drives `happy`, `aa` and
-//! `blinkRight` alongside the bones, but both consumers look the avatar's
-//! expressions up through the legacy subtree named `VRMC_vrm.expressions`
-//! (`play_expression_animations`, `src/vrma/animation/play.rs:152`, and
-//! `apply_regenerate_expression_clips`,
-//! `src/vrma/animation/animation_graph.rs:492`), and only the legacy loader
-//! spawns that subtree (`src/vrm/expressions.rs:452`). The pipeline writes
-//! `VrmExpressionWeights` / `ExpressionMorphBinds` on the root instead, but
-//! nothing yet moves a `.vrma`'s expression curves onto them.
+//! Its *expression* tracks cannot be played as authored - `VRMA_01.vrma` drives
+//! `happy`, `aa` and `blinkRight`, and per the specification each is a plain
+//! `translation` curve whose **x component** is the weight, which nothing can
+//! consume as a morph. `retarget_expression_curves`
+//! (`src/vrma/animation/expressions.rs:154`) rewrites each one into a single
+//! [`ExpressionWeightProperty`] curve addressed by
+//! [`vrm_root_animation_target`], the synthetic target `setup_animation` puts
+//! on the avatar root (`src/vrm/gltf/handler/scene.rs:581`). Evaluating that
+//! curve writes the root's `VrmExpressionWeights`, which
+//! [`apply_expression_morph_binds`] distributes into the meshes' `MorphWeights`
+//! in the same frame - and all three names are expressions `AliciaSolid`
+//! declares, so each one has somewhere to land.
+//!
+//! Both halves write into the *same* `AnimationClip` asset
+//! (`src/vrma/animation/animation_graph.rs:163-246`), which is what lets the
+//! single [`PlayVrma`] below cover the body and the face together, and what
+//! keeps the two from drifting apart.
+//!
+//! # Known gap: eye gaze
+//!
+//! `VRMC_vrm_animation.lookAt` is not read. The schema the `.vrma` loader
+//! deserializes (`src/vrma/gltf/extensions.rs:33-39`) has no `lookAt` field, so
+//! a file's gaze direction and `offsetFromHeadBone` are dropped.
+//!
+//! That is where the specification puts gaze anyway: `leftEye` / `rightEye` may
+//! not carry humanoid animation data, and `lookUp` / `lookDown` / `lookLeft` /
+//! `lookRight` may not carry expression data, because `LookAt` is their only
+//! permitted source. So a `.vrma` that animates gaze drives nothing here.
+//! `VRMA_01.vrma` declares no `lookAt`, so this example cannot show the gap -
+//! it is recorded so the missing field is not mistaken for an oversight in the
+//! expression retarget above.
 
 use bevy::animation::RepeatAnimation;
 use bevy::prelude::*;

@@ -25,25 +25,58 @@
 //! (`src/vrma/initialize.rs:116-142`), which is what keeps the four transitions
 //! below addressing the same graph.
 //!
-//! # Known gap
+//! # Both kinds of track transition
 //!
-//! The bone tracks the transition is about do play on a load-time-spawned
+//! The bone tracks this transition is about do play on a load-time-spawned
 //! avatar: the retarget resolves the destination bone by [`VrmBone`], which the
 //! pipeline writes on every bone (`src/vrm/gltf/handler/nodes.rs:39`), and the
 //! graph, its mask groups and the `AnimationPlayer` on `Vrm::ROOT_BONE` are all
-//! built from components a pipeline scene does carry.
+//! built from components a pipeline scene does carry
+//! (`src/vrm/gltf/handler/scene.rs:548-593`).
 //!
-//! The *expression* tracks do not. `VRMA_01.vrma` drives `happy`, `aa` and
-//! `blinkRight` alongside the bones, but both consumers resolve the avatar's
-//! expressions through the legacy subtree named `VRMC_vrm.expressions`
-//! (`play_expression_animations`, `src/vrma/animation/play.rs:152`, and
-//! `apply_regenerate_expression_clips`,
-//! `src/vrma/animation/animation_graph.rs:492`), and only the legacy loader
-//! spawns that subtree (`src/vrm/expressions.rs:452`). The pipeline writes
-//! `VrmExpressionWeights` / `ExpressionMorphBinds` on the root instead, but
-//! nothing yet moves a `.vrma`'s expression curves onto them - so the
-//! interpolation caveat above is about bones only, and expressions are simply
-//! absent rather than mis-blended.
+//! The *expression* tracks transition with them. `VRMA_01.vrma` drives `happy`,
+//! `aa` and `blinkRight`, `VRMA_02.vrma` drives `happy` and `blink`, and
+//! `VRMA_03.vrma` drives `happy` - each encoded, per the specification, as a
+//! `translation` curve whose x component is the weight, which nothing can
+//! consume as a morph. `retarget_expression_curves`
+//! (`src/vrma/animation/expressions.rs:154`) rewrites each into a single
+//! [`ExpressionWeightProperty`] curve addressed by
+//! [`vrm_root_animation_target`], the synthetic target `setup_animation` puts
+//! on the avatar root (`src/vrm/gltf/handler/scene.rs:581`), and the weights
+//! reach the meshes through [`apply_expression_morph_binds`]. Both halves land
+//! in the *same* `AnimationClip` asset
+//! (`src/vrma/animation/animation_graph.rs:163-246`), so the one
+//! [`PlayVrma`] per key blends the face and the body with a single
+//! `AnimationTransitions` weight and the two cannot drift apart.
+//!
+//! Two consequences worth knowing:
+//!
+//! * `different_pose.vrma` (key `4`) declares **no** `expressions` at all - only a
+//!   `humanoid` block - so it contributes no expression curves and never drives
+//!   the face to neutral. Its `PlayVrma` zeroes nothing
+//!   (`reset_expression_weights` clears the expressions the clip *declares*,
+//!   `play.rs:101`), and this example never triggers [`StopVrma`], which is what
+//!   would clear the outgoing clip's own expressions (`play.rs:153-181`). Press
+//!   `4` while a face is playing and that face keeps the last weight the
+//!   previous clip wrote.
+//! * the caveat at the top of this file is about bones only, and this example
+//!   does not resolve it. The retarget normalizes each `.vrma` against the
+//!   destination's rest pose
+//!   (`src/vrma/animation/bone_rotation.rs:88-97`), so all four clips evaluate
+//!   the avatar's own rest pose at `t = 0`; what `AnimationTransitions` then
+//!   interpolates is those already-composed world rotations, and blending two
+//!   quaternions is not the same as blending the local deltas they were built
+//!   from.
+//!
+//! # Known gap: eye gaze
+//!
+//! `VRMC_vrm_animation.lookAt` is not read - the schema the `.vrma` loader
+//! deserializes (`src/vrma/gltf/extensions.rs:33-39`) has no such field - so a
+//! file's gaze direction and `offsetFromHeadBone` are dropped. Per the
+//! specification `LookAt` is also the only permitted source of gaze, since
+//! `leftEye` / `rightEye` may not carry humanoid animation data and `lookUp` /
+//! `lookDown` / `lookLeft` / `lookRight` may not carry expression data. None of
+//! these four files declares `lookAt`, so nothing here is affected.
 
 use bevy::animation::RepeatAnimation;
 use bevy::input::common_conditions::input_just_pressed;

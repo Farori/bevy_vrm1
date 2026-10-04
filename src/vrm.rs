@@ -75,7 +75,6 @@ new_type!(
 pub struct Vrm;
 
 impl Vrm {
-    pub const EXPRESSIONS_ROOT: &'static str = "VRMC_vrm.expressions";
     pub const ROOT_BONE: &'static str = "VRMC_vrm.root_bone";
 }
 
