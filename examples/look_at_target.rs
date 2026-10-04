@@ -2,9 +2,9 @@
 //! The VRM model will track a red cube as its target.
 //! The cube can be freely moved by dragging it with the mouse.
 //!
-//! `LookAt::Target` goes on the VRM root, which under the pipeline is the entity
-//! the scene asset instantiates; `Initialized` marks it, so the example attaches
-//! the component when that marker appears instead of assuming an entity id.
+//! [`spawn_vrm`]'s `configure` closure captures the cube, so `LookAt::Target`
+//! needs no `LookTarget` resource and no `Added<Initialized>` system: the
+//! closure runs on the VRM root as soon as the avatar is instantiated.
 //!
 //! # Known gap
 //!
@@ -13,21 +13,16 @@
 //! those. Until the pipeline resolves them from `VRMC_vrm.humanoid` too, the
 //! avatar does not follow the cube.
 
-use bevy::gltf::GltfAssetLabel;
 use bevy::prelude::*;
 use bevy_vrm1::prelude::*;
-
-/// The entity the avatar looks at, published when the cube is spawned and read
-/// once the avatar's root exists.
-#[derive(Resource, Default)]
-struct LookTarget(Option<Entity>);
 
 fn main() {
     App::new()
         .add_plugins((DefaultPlugins, VrmPlugin, VrmGltfPlugin, MeshPickingPlugin))
-        .init_resource::<LookTarget>()
-        .add_systems(Startup, (spawn_camera, spawn_vrm, spawn_directional_light))
-        .add_systems(Update, attach_look_at)
+        .add_systems(
+            Startup,
+            (spawn_camera, spawn_avatar, spawn_directional_light),
+        )
         .run();
 }
 
@@ -52,12 +47,10 @@ fn spawn_camera(mut commands: Commands) {
     ));
 }
 
-fn spawn_vrm(
+fn spawn_avatar(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mut target: ResMut<LookTarget>,
-    asset_server: Res<AssetServer>,
 ) {
     let cube = commands
         .spawn((
@@ -69,25 +62,9 @@ fn spawn_vrm(
         ))
         .observe(apply_drag_move_cube)
         .id();
-    target.0 = Some(cube);
-    commands.spawn(WorldAssetRoot(
-        asset_server.load(GltfAssetLabel::Scene(0).from_asset("vrm/AliciaSolid.vrm")),
-    ));
-}
-
-/// Puts `LookAt::Target` on the scene root as soon as the handler has finished
-/// it.
-fn attach_look_at(
-    mut commands: Commands,
-    target: Res<LookTarget>,
-    vrms: Query<Entity, Added<Initialized>>,
-) {
-    let Some(target) = target.0 else {
-        return;
-    };
-    for vrm in vrms.iter() {
-        commands.entity(vrm).insert(LookAt::Target(target));
-    }
+    spawn_vrm(&mut commands, "vrm/AliciaSolid.vrm", move |root| {
+        root.insert(LookAt::Target(cube));
+    });
 }
 
 fn apply_drag_move_cube(

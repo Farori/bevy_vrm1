@@ -1,42 +1,37 @@
 //! `BodyTracking` spreads the gaze of a [`LookAt`] over the spine, chest, neck
 //! and head bones instead of leaving it to the eyes alone.
 //!
-//! Both components go on the VRM root, which under the pipeline is the entity
-//! the scene asset instantiates. `Initialized` marks it, so the example attaches
-//! them when that marker appears rather than assuming an entity id.
+//! Both components go on the VRM root, and [`spawn_vrm`]'s `configure` closure
+//! is handed that root directly: no `Added<Initialized>` system, no lookup.
+//! `BodyTrackingPlugin` observes the insert of `BodyTracking` and adds the
+//! `SmoothedGaze` state it keeps, so nothing else has to be set up here.
 //!
 //! # Known gap
 //!
 //! `BodyTracking` reads the same `HeadBoneEntity`, `NeckBoneEntity`,
-//! `ChestBoneEntity` and `SpineBoneEntity` components as `LookAt`, and requires
-//! the root to carry the `Vrm` marker. Neither is written by `VrmGltfPlugin`,
-//! so the bones stay in their rest pose for now.
+//! `ChestBoneEntity` and `SpineBoneEntity` components as `LookAt`, and only the
+//! legacy loader writes those, so the bones stay in their rest pose for now.
 
-use bevy::gltf::GltfAssetLabel;
 use bevy::prelude::*;
 use bevy_vrm1::prelude::*;
 
 fn main() {
     App::new()
         .add_plugins((DefaultPlugins, VrmPlugin, VrmGltfPlugin))
-        .add_systems(Startup, (spawn_camera_and_vrm, spawn_directional_light))
-        .add_systems(Update, attach_body_tracking)
+        .add_systems(Startup, (spawn_camera_and_avatar, spawn_directional_light))
         .run();
 }
 
-fn spawn_camera_and_vrm(
-    mut commands: Commands,
-    asset_server: Res<AssetServer>,
-) {
+fn spawn_camera_and_avatar(mut commands: Commands) {
     commands.spawn((
         Camera3d::default(),
         // A default camera does not render the exclusive first-person layers.
         third_person_camera_layers(),
         Transform::from_xyz(0.0, 1.3, 1.0),
     ));
-    commands.spawn(WorldAssetRoot(
-        asset_server.load(GltfAssetLabel::Scene(0).from_asset("vrm/AliciaSolid.vrm")),
-    ));
+    spawn_vrm(&mut commands, "vrm/AliciaSolid.vrm", |root| {
+        root.insert((LookAt::Cursor, BodyTracking::default()));
+    });
 }
 
 fn spawn_directional_light(mut commands: Commands) {
@@ -49,18 +44,4 @@ fn spawn_directional_light(mut commands: Commands) {
         all_vrm_render_layers(),
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -1.0, 1.0, 0.0)),
     ));
-}
-
-/// Inserts the components on the scene root as soon as the handler has finished
-/// it. `BodyTrackingPlugin` observes the insert of `BodyTracking` and adds the
-/// `SmoothedGaze` state it keeps, so nothing else has to be set up here.
-fn attach_body_tracking(
-    mut commands: Commands,
-    vrms: Query<Entity, Added<Initialized>>,
-) {
-    for vrm in vrms.iter() {
-        commands
-            .entity(vrm)
-            .insert((LookAt::Cursor, BodyTracking::default()));
-    }
 }

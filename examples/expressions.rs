@@ -11,10 +11,9 @@
 //! - 8: ee lip-sync (`ModifyExpressions::mouth` — resets other vowels)
 //! - 0: clear all expressions (return to VRMA control)
 //!
-//! The triggers are targeted at the VRM root, which under the pipeline is the
-//! entity the scene asset instantiates rather than the `WorldAssetRoot` entity
-//! the example spawned. `VrmGltfPlugin` writes `Initialized` onto that root
-//! while the file loads, so this example finds it by marker.
+//! `configure` marks the VRM root, which is what the triggers below are aimed
+//! at: `SetExpressions` and `ModifyExpressions` are entity events, so they need
+//! the avatar's own entity, and the closure is where an app gets it.
 //!
 //! # Known gap
 //!
@@ -24,14 +23,17 @@
 //! `ExpressionMorphBinds` and `ExpressionSettings`, all on the same root - is read
 //! by `apply_expression_morph_binds`, which no plugin schedules yet.
 
-use bevy::gltf::GltfAssetLabel;
 use bevy::prelude::*;
 use bevy_vrm1::prelude::*;
+
+/// Marks the avatar this example drives.
+#[derive(Component)]
+struct Avatar;
 
 fn main() {
     App::new()
         .add_plugins((DefaultPlugins, VrmPlugin, VrmGltfPlugin))
-        .add_systems(Startup, (spawn_light, spawn_camera, spawn_vrm))
+        .add_systems(Startup, (spawn_light, spawn_camera, spawn_avatar))
         .add_systems(Update, control_expressions)
         .run();
 }
@@ -57,21 +59,18 @@ fn spawn_camera(mut commands: Commands) {
     ));
 }
 
-fn spawn_vrm(
-    mut commands: Commands,
-    asset_server: Res<AssetServer>,
-) {
-    commands.spawn(WorldAssetRoot(
-        asset_server.load(GltfAssetLabel::Scene(0).from_asset("vrm/Elmer.vrm")),
-    ));
+fn spawn_avatar(mut commands: Commands) {
+    spawn_vrm(&mut commands, "vrm/Elmer.vrm", |root| {
+        root.insert(Avatar);
+    });
 }
 
 fn control_expressions(
     mut commands: Commands,
-    vrms: Query<Entity, With<Initialized>>,
+    avatars: Query<Entity, With<Avatar>>,
     input: Res<ButtonInput<KeyCode>>,
 ) {
-    for vrm in vrms.iter() {
+    for vrm in &avatars {
         // SetExpressions: replaces all overrides
         if input.just_pressed(KeyCode::Digit1) {
             commands.trigger(SetExpressions::single(vrm, "happy", 1.0));

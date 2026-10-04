@@ -2,11 +2,13 @@
 //!
 //! This is the acceptance case for the load-time pipeline: `VrmGltfPlugin`
 //! registers the VRM extension handler, so `bevy_gltf` writes every VRM
-//! component into the scene asset while the file loads and a `SceneRoot` of it is
-//! born initialized. `VrmPlugin` supplies the runtime systems (spring bones,
-//! gaze control, expressions, node constraints) on top.
+//! component into the scene asset while the file loads and a `WorldAssetRoot` of
+//! it is born initialized. `VrmPlugin` supplies the runtime systems (spring
+//! bones, gaze control, expressions, node constraints) on top.
+//!
+//! [`spawn_vrm`] is how an app spawns a `.vrm`; the returned entity is the one
+//! that positions the avatar.
 
-use bevy::gltf::GltfAssetLabel;
 use bevy::prelude::*;
 use bevy_panorbit_camera::{PanOrbitCamera, PanOrbitCameraPlugin};
 use bevy_vrm1::prelude::*;
@@ -22,7 +24,10 @@ fn main() {
             VrmGltfPlugin,
             PanOrbitCameraPlugin,
         ))
-        .add_systems(Startup, (spawn_camera, spawn_vrm, spawn_directional_light))
+        .add_systems(
+            Startup,
+            (spawn_camera, spawn_avatar, spawn_directional_light),
+        )
         .run();
 }
 
@@ -61,12 +66,8 @@ fn spawn_camera(
     ));
 }
 
-fn spawn_vrm(
-    mut commands: Commands,
-    asset_server: Res<AssetServer>,
-) {
-    // A `.vrm` file loads like any glTF scene: the handler does the rest.
-    commands.spawn(WorldAssetRoot(
-        asset_server.load(GltfAssetLabel::Scene(0).from_asset("vrm/Elmer.vrm")),
-    ));
+fn spawn_avatar(mut commands: Commands) {
+    // A `.vrm` file loads like any glTF scene: the handler does the rest, so
+    // there is nothing left for `configure` to do.
+    spawn_vrm(&mut commands, "vrm/Elmer.vrm", |_root| {});
 }

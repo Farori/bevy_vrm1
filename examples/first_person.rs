@@ -23,7 +23,6 @@
 
 use bevy::camera::visibility::RenderLayers;
 use bevy::camera::{ClearColorConfig, Viewport};
-use bevy::gltf::GltfAssetLabel;
 use bevy::prelude::*;
 use bevy_vrm1::prelude::*;
 
@@ -36,16 +35,21 @@ struct FirstPersonMode {
     saved_camera: Option<Transform>,
 }
 
-/// The avatar's head bone, resolved once the scene has been instantiated.
+/// The avatar's head bone, published when `configure` marks the VRM root and
+/// read by [`attach_head_camera`].
 #[derive(Resource, Default)]
 struct HeadBone(Option<Entity>);
+
+/// Marks the VRM root so the systems below can find *this* avatar's bones.
+#[derive(Component)]
+struct Avatar;
 
 fn main() {
     App::new()
         .add_plugins((DefaultPlugins, VrmPlugin, VrmGltfPlugin))
         .init_resource::<FirstPersonMode>()
         .init_resource::<HeadBone>()
-        .add_systems(Startup, (spawn_main_camera, spawn_scene, spawn_vrm))
+        .add_systems(Startup, (spawn_main_camera, spawn_scene, spawn_avatar))
         .add_systems(
             Update,
             (
@@ -103,57 +107,56 @@ fn spawn_main_camera(mut commands: Commands) {
     ));
 }
 
-fn spawn_vrm(
-    mut commands: Commands,
-    asset_server: Res<AssetServer>,
-) {
-    commands.spawn(WorldAssetRoot(
-        asset_server.load(GltfAssetLabel::Scene(0).from_asset("vrm/AliciaSolid.vrm")),
-    ));
+fn spawn_avatar(mut commands: Commands) {
+    // First-person needs nothing at load time, so `configure` only marks the root
+    // for the systems below. This is where an app would split layers or move
+    // meshes instead.
+    spawn_vrm(&mut commands, "vrm/AliciaSolid.vrm", |root| {
+        root.insert(Avatar);
+    });
 }
 
-/// Attaches a picture-in-picture camera to the head bone once the avatar has
-/// been instantiated.
+/// Attaches a picture-in-picture camera to the head bone of a freshly configured
+/// avatar.
 ///
-/// `Initialized` is the pipeline's readiness signal - it is written onto the
-/// scene root inside the scene asset - and the head bone is found through the
-/// `VrmBone` the handler puts on every humanoid bone.
+/// The head bone is found *inside that avatar*, so the lookup is scoped by
+/// `ChildSearcher` to the root `configure` marked, rather than by a global search
+/// over every `VrmBone` in the world.
 fn attach_head_camera(
     mut commands: Commands,
     mut head: ResMut<HeadBone>,
-    vrms: Query<Entity, Added<Initialized>>,
-    bones: Query<(Entity, &VrmBone)>,
+    avatars: Query<Entity, Added<Avatar>>,
+    searcher: ChildSearcher,
 ) {
-    if vrms.is_empty() {
-        return;
-    }
-    let Some((head_bone, _)) = bones.iter().find(|(_, bone)| bone.0 == "head") else {
-        return;
-    };
-    head.0 = Some(head_bone);
-    commands.entity(head_bone).with_children(|spawner| {
-        spawner.spawn((
-            Camera3d::default(),
-            Camera {
-                // Render on top of the main camera.
-                order: 1,
-                viewport: Some(Viewport {
-                    physical_position: UVec2::new(10, 10),
-                    physical_size: UVec2::new(400, 300),
+    for avatar in &avatars {
+        let Some(head_bone) = searcher.find_by_bone_name(avatar, &VrmBone::from("head")) else {
+            continue;
+        };
+        head.0 = Some(head_bone);
+        commands.entity(head_bone).with_children(|spawner| {
+            spawner.spawn((
+                Camera3d::default(),
+                Camera {
+                    // Render on top of the main camera.
+                    order: 1,
+                    viewport: Some(Viewport {
+                        physical_position: UVec2::new(10, 10),
+                        physical_size: UVec2::new(400, 300),
+                        ..default()
+                    }),
+                    // A distinct background makes the viewport clearly visible.
+                    clear_color: ClearColorConfig::Custom(Color::srgb(0.05, 0.05, 0.15)),
                     ..default()
-                }),
-                // A distinct background makes the viewport clearly visible.
-                clear_color: ClearColorConfig::Custom(Color::srgb(0.05, 0.05, 0.15)),
-                ..default()
-            },
-            // A first-person view: the ordinary scene plus whatever the file
-            // marked `firstPersonOnly`, but never the head copies.
-            first_person_camera_layers(),
-            // At eye level, tilted down so the body is in view.
-            Transform::from_xyz(0.0, 0.06, 0.0)
-                .looking_to(Dir3::new(Vec3::new(0.0, -0.4, 1.0)).unwrap(), Vec3::Y),
-        ));
-    });
+                },
+                // A first-person view: the ordinary scene plus whatever the file
+                // marked `firstPersonOnly`, but never the head copies.
+                first_person_camera_layers(),
+                // At eye level, tilted down so the body is in view.
+                Transform::from_xyz(0.0, 0.06, 0.0)
+                    .looking_to(Dir3::new(Vec3::new(0.0, -0.4, 1.0)).unwrap(), Vec3::Y),
+            ));
+        });
+    }
 }
 
 /// Press `F` to toggle the main camera between the external third-person view
@@ -168,7 +171,7 @@ fn toggle_main_camera(
         return;
     }
     mode.enabled = !mode.enabled;
-    for (mut transform, mut render_layers) in cameras.iter_mut() {
+    for (mut transform, mut render_layers) in &mut cameras {
         if mode.enabled {
             // Remember the external view to restore it later.
             mode.saved_camera = Some(*transform);
@@ -205,7 +208,7 @@ fn sync_first_person_camera(
     let Ok(forward) = Dir3::new(head_global.rotation() * Vec3::Z) else {
         return;
     };
-    for mut transform in cameras.iter_mut() {
+    for mut transform in &mut cameras {
         *transform = Transform::from_translation(eye).looking_to(forward, Vec3::Y);
     }
 }

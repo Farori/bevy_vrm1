@@ -8,14 +8,16 @@
 //! `SpringRoot`, `SpringJointProps` and `SpringJointState` on the bones of the
 //! scene asset, so there is nothing left to initialize once the avatar appears.
 
-use bevy::gltf::GltfAssetLabel;
 use bevy::prelude::*;
 use bevy_vrm1::prelude::*;
 
 fn main() {
     App::new()
         .add_plugins((DefaultPlugins, VrmPlugin, VrmGltfPlugin, MeshPickingPlugin))
-        .add_systems(Startup, (spawn_camera, spawn_vrm, spawn_directional_light))
+        .add_systems(
+            Startup,
+            (spawn_camera, spawn_avatar, spawn_directional_light),
+        )
         .run();
 }
 
@@ -40,15 +42,11 @@ fn spawn_camera(mut commands: Commands) {
     ));
 }
 
-fn spawn_vrm(
-    mut commands: Commands,
-    asset_server: Res<AssetServer>,
-) {
-    commands
-        .spawn(WorldAssetRoot(asset_server.load(
-            GltfAssetLabel::Scene(0).from_asset("vrm/AliciaSolid.vrm"),
-        )))
-        .observe(apply_drag_move_vrm);
+fn spawn_avatar(mut commands: Commands) {
+    // Spring bones need no configuration, so `configure` is empty here. The
+    // returned entity is the avatar's parent, so dragging it drags the whole
+    // model.
+    spawn_vrm(&mut commands, "vrm/AliciaSolid.vrm", |_root| {}).observe(apply_drag_move_vrm);
 }
 
 /// The picked mesh is a descendant of the `WorldAssetRoot` entity, which is the

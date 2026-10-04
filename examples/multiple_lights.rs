@@ -10,7 +10,6 @@
 //! exclusive layer 1. A light whose layers are set explicitly is left exactly as
 //! it is, so such a light has to include layers 1 and 2 itself.
 
-use bevy::gltf::GltfAssetLabel;
 use bevy::prelude::*;
 use bevy_vrm1::prelude::*;
 
@@ -28,7 +27,10 @@ fn main() {
             VrmGltfPlugin,
             VrmLightLayersPlugin,
         ))
-        .add_systems(Startup, (spawn_camera, spawn_vrm, spawn_directional_light))
+        .add_systems(
+            Startup,
+            (spawn_camera, spawn_avatar, spawn_directional_light),
+        )
         .add_systems(Update, (rotate_circle, rotate_arc))
         .run();
 }
@@ -77,13 +79,8 @@ fn spawn_camera(
     ));
 }
 
-fn spawn_vrm(
-    mut commands: Commands,
-    asset_server: Res<AssetServer>,
-) {
-    commands.spawn(WorldAssetRoot(
-        asset_server.load(GltfAssetLabel::Scene(0).from_asset("vrm/AliciaSolid.vrm")),
-    ));
+fn spawn_avatar(mut commands: Commands) {
+    spawn_vrm(&mut commands, "vrm/AliciaSolid.vrm", |_root| {});
 }
 
 fn rotate_circle(

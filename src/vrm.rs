@@ -12,6 +12,7 @@ mod look_at;
 mod mtoon;
 mod node_constraint;
 pub(crate) mod runtime;
+pub mod spawn;
 pub mod spring_bone;
 
 use crate::macros::marker_component;
@@ -65,6 +66,7 @@ pub mod prelude {
         node_constraint::{
             AimConstraintDestinations, RollConstraintDestinations, RotationConstraintDestinations,
         },
+        spawn::spawn_vrm,
         spring_bone::{SpringJointProps, SpringJoints, SpringRoot},
     };
 }
@@ -147,7 +149,9 @@ marker_component!(
 );
 /// The main plugin for VRM support in Bevy.
 ///
-/// Please refer to [`VrmHandle`](crate::prelude::VrmHandle) for more details.
+/// Spawn a `.vrm` with [`spawn_vrm`](crate::prelude::spawn_vrm), the supported
+/// way; the legacy [`VrmHandle`](crate::prelude::VrmHandle) path is removed by a
+/// follow-up commit.
 pub struct VrmPlugin;
 
 impl Plugin for VrmPlugin {
@@ -168,6 +172,12 @@ impl Plugin for VrmPlugin {
             BodyTrackingPlugin,
             VrmFirstPersonPlugin,
         ));
+
+        // The watchdog half of `spawn_vrm`: a pending spawn whose instance never
+        // arrives is warned about once and dropped, so nothing panics and no
+        // closure is held for the rest of the session.
+        app.init_resource::<spawn::PendingVrmSpawns>()
+            .add_systems(Update, spawn::warn_never_ready);
 
         // Add manual transform propagation systems to follow VRM spec update order
         // See: https://vrm.dev/api/api_update/
