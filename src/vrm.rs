@@ -3,14 +3,10 @@ pub mod components;
 pub mod coords;
 pub mod detach;
 pub(crate) mod expressions;
-pub(crate) mod first_person;
 pub(crate) mod gltf;
 pub(crate) mod humanoid_bone;
-mod initialize;
-mod loader;
 mod look_at;
 mod mtoon;
-mod node_constraint;
 pub(crate) mod runtime;
 pub mod spawn;
 pub mod spring_bone;
@@ -21,17 +17,12 @@ use crate::system_set::VrmSystemSets;
 use crate::vrm::body_tracking::BodyTrackingPlugin;
 use crate::vrm::detach::VrmDetachPlugin;
 use crate::vrm::humanoid_bone::VrmHumanoidBonePlugin;
-use crate::vrm::initialize::VrmInitializePlugin;
-use crate::vrm::loader::{VrmAsset, VrmLoaderPlugin};
 use crate::vrm::look_at::LookAtPlugin;
-use crate::vrm::node_constraint::VrmNodeConstraintPlugin;
 use crate::vrm::spring_bone::VrmSpringBonePlugin;
 use bevy::app::{AnimationSystems, App, Plugin};
-use bevy::asset::AssetApp;
 use bevy::prelude::*;
 use bevy::transform::systems::{propagate_parent_transforms, sync_simple_transforms};
 use expressions::VrmExpressionPlugin;
-use first_person::VrmFirstPersonPlugin;
 use mtoon::MtoonMaterialPlugin;
 use std::path::PathBuf;
 
@@ -50,22 +41,12 @@ pub mod prelude {
         coords::{VrmForwardPolicy, resolve_forward_policy},
         detach::RequestDetachVrm,
         expressions::{
-            BinaryExpression, ClearExpressions, EffectiveExpressionWeight, ExpressionEntityMap,
-            ExpressionOverride, ExpressionOverrideSettings, ExpressionOverrideType,
-            ModifyExpressions, SetExpressions,
-        },
-        first_person::{
-            FirstPersonCamera, FirstPersonLayers, FirstPersonRegistry, RequestDisableFirstPerson,
-            RequestEnableFirstPerson, ThirdPersonCamera,
+            ClearExpressions, ExpressionOverrideType, ModifyExpressions, SetExpressions,
         },
         gltf::prelude::*,
         humanoid_bone::prelude::*,
-        loader::{VrmAsset, VrmHandle},
         look_at::LookAt,
         mtoon::prelude::*,
-        node_constraint::{
-            AimConstraintDestinations, RollConstraintDestinations, RotationConstraintDestinations,
-        },
         spawn::spawn_vrm,
         spring_bone::{SpringJointProps, SpringJoints, SpringRoot},
     };
@@ -84,7 +65,9 @@ new_type!(
 );
 
 /// A marker component attached to the entity of VRM.
-/// This component is automatically inserted after the [`VrmHandle`](crate::prelude::VrmHandle) is loaded.
+/// This component is automatically inserted by the load-time glTF pipeline while
+/// the `.vrm` file loads, onto the scene root of the resulting
+/// [`WorldAsset`](bevy::world_serialization::WorldAsset).
 #[derive(Debug, Component, Reflect, Copy, Clone)]
 #[reflect(Component)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -97,7 +80,8 @@ impl Vrm {
 }
 
 /// The path to the VRM file.
-/// This component is automatically inserted after the [`VrmHandle`](crate::prelude::VrmHandle) is loaded.
+/// This component is automatically inserted by the load-time glTF pipeline while
+/// the `.vrm` file loads, from the loader's `LoadContext`.
 #[derive(Debug, Reflect, Clone, Component)]
 #[reflect(Component)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -144,14 +128,29 @@ pub struct RestWorldTransform(pub GlobalTransform);
 
 marker_component!(
     /// A marker component attached to the entity of VRM.
-    /// This component is automatically inserted after the [`VrmHandle`](crate::prelude::VrmHandle) is loaded.
+    /// This component is automatically inserted by the load-time glTF pipeline
+    /// while the `.vrm` file loads.
     Initialized
 );
 /// The main plugin for VRM support in Bevy.
 ///
-/// Spawn a `.vrm` with [`spawn_vrm`](crate::prelude::spawn_vrm), the supported
-/// way; the legacy [`VrmHandle`](crate::prelude::VrmHandle) path is removed by a
-/// follow-up commit.
+/// This is the **runtime** half: it adds the systems that evaluate what
+/// [`VrmGltfPlugin`](crate::prelude::VrmGltfPlugin) wrote into the scene while
+/// the file loaded — spring bones, gaze control, expressions, node constraints
+/// and `MToon` rendering — plus the [`spawn_vrm`](crate::prelude::spawn_vrm)
+/// watchdog.
+///
+/// It does not load a `.vrm` by itself. An app also needs
+/// [`VrmGltfPlugin`](crate::prelude::VrmGltfPlugin), which is the only plugin
+/// that claims the `vrm` extension; add `VrmaPlugin` on top for `.vrma`
+/// playback.
+///
+/// ```no_run
+/// # use bevy::prelude::*;
+/// # use bevy_vrm1::prelude::*;
+/// # let mut app = App::new();
+/// app.add_plugins((DefaultPlugins, VrmPlugin, VrmGltfPlugin));
+/// ```
 pub struct VrmPlugin;
 
 impl Plugin for VrmPlugin {
@@ -159,18 +158,14 @@ impl Plugin for VrmPlugin {
         &self,
         app: &mut App,
     ) {
-        app.init_asset::<VrmAsset>().add_plugins((
-            VrmLoaderPlugin,
-            VrmInitializePlugin,
+        app.add_plugins((
             VrmDetachPlugin,
             VrmSpringBonePlugin,
             VrmHumanoidBonePlugin,
             VrmExpressionPlugin,
-            VrmNodeConstraintPlugin,
             MtoonMaterialPlugin,
             LookAtPlugin,
             BodyTrackingPlugin,
-            VrmFirstPersonPlugin,
         ));
 
         // The watchdog half of `spawn_vrm`: a pending spawn whose instance never

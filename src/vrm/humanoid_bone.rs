@@ -1,21 +1,22 @@
 //! This module handles humanoid bones.
 //! Refer to [here](https://docs.unity3d.com/ja/2019.4/ScriptReference/HumanBodyBones.html) for the list of humanoid bones.
 //!
-//! After the VRM(A) is loaded, marker components are inserted for each bone.
-//! For example, the entity of the hips bone will have [`Hips`] inserted.
+//! Marker components are written for each bone while the VRM(A) loads. For
+//! example, the entity of the hips bone will have [`Hips`] inserted.
 //! Additionally, a component that holds the entity will be inserted into the VRM(A) entity.
 //!
-//! The setup of these is done after all bones have been spawned, so there may be a slight delay.
+//! For a `.vrm` these are written into the scene
+//! [`WorldAsset`](bevy::world_serialization::WorldAsset) by the load-time glTF
+//! pipeline ([`scene::insert_humanoid_bone_holders`](crate::vrm::gltf::handler::scene));
+//! a `.vrma` builds its own source rig through
+//! [`HumanoidBoneRegistry::new`], which the VRMA retarget reads.
 
 mod bones;
 
-use crate::error::vrm_warn;
 use crate::prelude::*;
+use crate::vrm::VrmBone;
 use crate::vrm::gltf::extensions::VrmNode;
 use crate::vrm::humanoid_bone::bones::BonesPlugin;
-use crate::vrm::{RestGlobalTransform, RestTransform, RestWorldTransform, VrmBone};
-use crate::vrma::RetargetSource;
-use bevy::animation::{AnimatedBy, AnimationTargetId};
 use bevy::app::{App, Plugin};
 use bevy::asset::{Assets, Handle};
 use bevy::gltf::GltfNode;
@@ -26,13 +27,20 @@ pub mod prelude {
     pub use crate::vrm::humanoid_bone::bones::*;
 }
 
-#[derive(EntityEvent)]
-pub(crate) struct RequestInitializeHumanoidBones(pub(crate) Entity);
-
+/// The humanoid bones a model declares, as `(bone, glTF node name)` pairs.
+///
+/// It is the avatar-side half of the VRMA retarget: a `.vrma` file carries node
+/// *references*, not names, so the source rig's bones are looked up by the node
+/// name its own `vrmc_vrm_animation.humanoid` block points at. Nothing about a
+/// `.vrm`'s bones is stored here — the load-time pipeline resolves those by
+/// glTF node index while the file loads and writes [`VrmBone`] plus the
+/// `<Bone>BoneEntity` holders straight into the scene asset.
 #[derive(Component, Deref, Reflect, Default)]
 pub(crate) struct HumanoidBoneRegistry(HashMap<VrmBone, Name>);
 
 impl HumanoidBoneRegistry {
+    /// Resolves the node names a humanoid map refers to, dropping every entry
+    /// whose node is missing from the file or not yet loaded.
     pub fn new(
         bones: &HashMap<String, VrmNode>,
         node_assets: &Assets<GltfNode>,
@@ -51,6 +59,13 @@ impl HumanoidBoneRegistry {
     }
 }
 
+/// Registers the bone markers and the bone-entity holders for apps that load a
+/// VRM without [`VrmGltfPlugin`](crate::prelude::VrmGltfPlugin).
+///
+/// [`crate::vrm::gltf::VrmGltfPlugin`] registers the same types itself, because
+/// the scene spawn pipeline drops any component whose type is not registered
+/// (`ReflectComponent::apply_or_insert_mapped`). Adding [`BonesPlugin`] twice is
+/// a no-op.
 pub(super) struct VrmHumanoidBonePlugin;
 
 impl Plugin for VrmHumanoidBonePlugin {
@@ -58,10 +73,8 @@ impl Plugin for VrmHumanoidBonePlugin {
         &self,
         app: &mut App,
     ) {
-        app.register_type::<HumanoidBoneRegistry>()
-            .add_plugins(BonesPlugin)
-            .add_observer(apply_insert_rest_transforms)
-            .add_observer(apply_initialize_humanoid_bones);
+        app.register_type::<HumanoidBoneRegistry>();
+        register_bone_components(app);
     }
 }
 
@@ -97,43 +110,34 @@ macro_rules! insert_bone {
 ///   ([`HeadBoneEntity`], [`NeckBoneEntity`], …), which is how a system
 ///   addresses a bone *through* the avatar rather than through the hierarchy:
 ///   [`track_looking_target`](crate::vrm::look_at::track_looking_target),
-///   [`track_body_tracking`](crate::vrm::body_tracking) and the first-person
-///   auto split all read them;
+///   [`track_body_tracking`](crate::vrm::body_tracking) and the load-time
+///   `firstPerson: auto` split all read them;
 /// * the bone entity gets its marker ([`Head`], [`LeftEye`], …), which is what a
 ///   reader uses to recognise a bone without resolving the holder.
 ///
-/// One definition, two callers: the legacy observer
-/// [`apply_initialize_humanoid_bones`], which patches a hierarchy that was
-/// spawned over several frames, and the load-time pipeline
-/// ([`scene::finalize`](crate::vrm::gltf::handler::scene)), which writes into
-/// the scene [`bevy::world_serialization::WorldAsset`] so a
+/// The only caller is the load-time pipeline
+/// ([`scene::insert_humanoid_bone_holders`](crate::vrm::gltf::handler::scene)),
+/// which writes into the scene [`bevy::world_serialization::WorldAsset`] so a
 /// `SceneRoot` is born holding them. A `bones` entry whose name is not one of the
 /// 55 Unity humanoid bone names inserts nothing — the macro has always fallen
 /// through on those.
 ///
 /// # Why `Commands`, and not `&mut World`
 ///
-/// The legacy caller is a system, and the writes are plain component inserts, so
-/// one definition has to serve it. `bevy_gltf`'s loader has no `Commands` to
-/// hand out, so the pipeline borrows the world's own command queue
-/// (`World::commands`) and flushes it (`World::flush`) before the world is
-/// frozen into a `WorldAsset` — the same two calls `bevy_ecs` documents for
-/// exactly this case.
+/// `bevy_gltf`'s loader has no `Commands` to hand out, so the pipeline borrows
+/// the world's own command queue (`World::commands`) and flushes it
+/// (`World::flush`) before the world is frozen into a `WorldAsset` — the same
+/// two calls `bevy_ecs` documents for exactly this case.
 ///
-/// # Open: the holders must remap their entity on instantiation
+/// # The holders follow the avatar
 ///
 /// Writing them into a scene asset is only half the job. The scene spawn
 /// pipeline remaps entity references through `Component::map_entities`
 /// (`bevy_ecs/src/reflect/component.rs:340`, `:345`, `:353`), which
-/// `#[derive(Component)]` generates from `#[entities]` field attributes — and
-/// `entity_component!` (`src/macros.rs:89-111`) does not write one, unlike
-/// [`VrmNodeConstraint::source`](crate::prelude::VrmNodeConstraint::source)
-/// (`src/vrm/components.rs:168-170`). So a holder instantiated from the scene
-/// still names the entity id of the loader's scratch world. Until
-/// `entity_component!` marks the field `#[entities]`, gaze control on an
-/// instantiated pipeline avatar sees a stale id: inert if nothing occupies it,
-/// a wrong bone if something does. Everything else about this function is
-/// final; that one attribute is not.
+/// `#[derive(Component)]` generates from `#[entities]` field attributes —
+/// `entity_component!` (`src/macros.rs:109-127`) writes that attribute on the
+/// holder's field, so an instantiated avatar's holders name its own bones and
+/// gaze control, body tracking and the first-person split resolve correctly.
 pub(crate) fn insert_bone_holders(
     root: Entity,
     commands: &mut Commands,
@@ -171,7 +175,7 @@ pub(crate) fn insert_bone_holders(
             RightToes,
             RightIndexDistal,
             LeftMiddleProximal,
-            LeftRingProximal,
+            RightRingProximal,
             LeftRingDistal,
             LeftThumbMetacarpal,
             LeftIndexIntermediate,
@@ -199,6 +203,7 @@ pub(crate) fn insert_bone_holders(
             RightEye,
             LeftMiddleIntermediate,
             RightRingDistal,
+            LeftIndexProximal,
             RightIndexProximal,
             RightMiddleDistal,
         );
@@ -210,258 +215,8 @@ pub(crate) fn insert_bone_holders(
 /// [`crate::vrm::gltf::VrmGltfPlugin`] calls this because the
 /// pipeline writes both families into the scene asset, and the scene spawn
 /// pipeline drops any component whose type is not registered
-/// (`ReflectComponent::apply_or_insert_mapped`). `VrmPlugin` would register them
+/// (`ReflectComponent::apply_or_insert_mapped`). [`VrmPlugin`] registers them
 /// too, and adding [`BonesPlugin`] twice is a no-op.
 pub(crate) fn register_bone_components(app: &mut App) {
     app.add_plugins(BonesPlugin);
-}
-
-fn apply_insert_rest_transforms(
-    trigger: On<RequestInitializeHumanoidBones>,
-    mut commands: Commands,
-    childrens: Query<&Children>,
-    transforms: Query<(&Transform, &GlobalTransform)>,
-) {
-    let vrm = trigger.event_target();
-    if let Ok((_, global)) = transforms.get(vrm) {
-        // Capture the application placement together with the bones' rests.
-        // VRM and VRMA may initialize under different world transforms.
-        commands.entity(vrm).insert(RestWorldTransform(*global));
-    }
-    insert_rest_transforms_recursive(&mut commands, vrm, &childrens, &transforms);
-}
-
-fn insert_rest_transforms_recursive(
-    commands: &mut Commands,
-    entity: Entity,
-    childrens: &Query<&Children>,
-    transforms: &Query<(&Transform, &GlobalTransform)>,
-) {
-    let Ok(children) = childrens.get(entity) else {
-        return;
-    };
-    for child in children {
-        let Ok((tf, gtf)) = transforms.get(*child) else {
-            continue;
-        };
-        commands
-            .entity(*child)
-            .insert((RestTransform(*tf), RestGlobalTransform(*gtf)));
-        insert_rest_transforms_recursive(commands, *child, childrens, transforms);
-    }
-}
-
-fn apply_initialize_humanoid_bones(
-    trigger: On<RequestInitializeHumanoidBones>,
-    mut commands: Commands,
-    searcher: ChildSearcher,
-    models: Query<&HumanoidBoneRegistry>,
-    parents: Query<&ChildOf>,
-    transforms: Query<(&Transform, &GlobalTransform)>,
-    has_vrm: Query<Has<Vrm>>,
-    names: Query<&Name>,
-) {
-    let model_entity = trigger.event_target();
-    let Ok(registry) = models.get(model_entity) else {
-        return;
-    };
-    let Some(hips_name) = registry.get(&VrmBone::from("hips")) else {
-        let name = names
-            .get(model_entity)
-            .map_or("unnamed", |name| name.as_str());
-        vrm_warn!(
-            "[VRM] Skipping humanoid bone initialization, `hips` bone is not declared ({name}, {model_entity:?})"
-        );
-        return;
-    };
-    let Some(hips) = searcher.find_from_name(model_entity, hips_name.as_str()) else {
-        return;
-    };
-    let Ok(ChildOf(root_bone)) = parents.get(hips) else {
-        return;
-    };
-    let has_vrm = has_vrm.get(model_entity).is_ok_and(|h| h);
-    commands
-        .entity(*root_bone)
-        .insert((AnimationPlayer::default(), AnimationTransitions::default()));
-    if has_vrm {
-        commands.entity(*root_bone).insert((
-            Name::new(Vrm::ROOT_BONE),
-            RetargetSource,
-            AnimationTargetId::from_name(&Name::new(Vrm::ROOT_BONE)),
-            AnimatedBy(*root_bone),
-        ));
-    }
-
-    // Collected first, written afterwards by [`insert_bone_holders`] — the same
-    // helper the load-time pipeline calls, so the two paths cannot drift apart.
-    // Order is irrelevant: every entry is one plain component insert on an
-    // already-resolved entity, and the commands are buffered anyway.
-    let mut bones = Vec::with_capacity(registry.iter().len());
-    for (bone, name) in registry.iter() {
-        let Some(bone_entity) = searcher.find_from_name(model_entity, name.as_str()) else {
-            continue;
-        };
-        let Ok((tf, gtf)) = transforms.get(bone_entity) else {
-            continue;
-        };
-        commands.entity(bone_entity).insert((
-            bone.clone(),
-            RestTransform(*tf),
-            RestGlobalTransform(*gtf),
-            RetargetSource,
-        ));
-        if has_vrm {
-            commands
-                .entity(bone_entity)
-                .insert((AnimationTargetId::from_name(name), AnimatedBy(*root_bone)));
-        }
-        bones.push((bone.clone(), bone_entity));
-    }
-    insert_bone_holders(model_entity, &mut commands, &bones);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::success;
-    use crate::tests::{TestResult, test_app};
-
-    /// Builds `model -> root_bone -> bone nodes` and registers the humanoid bone observer.
-    fn model_with_bones(
-        app: &mut App,
-        registry: HumanoidBoneRegistry,
-        bones: &[&'static str],
-    ) -> (Entity, Entity) {
-        app.add_observer(apply_initialize_humanoid_bones);
-        let model = app
-            .world_mut()
-            .spawn((Name::new("TestModel"), registry, Vrm))
-            .with_children(|children| {
-                children
-                    .spawn(Name::new(Vrm::ROOT_BONE))
-                    .with_children(|children| {
-                        for name in bones {
-                            children.spawn((
-                                Name::new(*name),
-                                Transform::default(),
-                                GlobalTransform::IDENTITY,
-                            ));
-                        }
-                    });
-            })
-            .id();
-        let root_bone = app.world().get::<Children>(model).unwrap()[0];
-        (model, root_bone)
-    }
-
-    /// A VRM declaring a `hips` humanoid bone still initializes as before.
-    #[test]
-    fn declared_hips_bone_is_initialized() -> TestResult {
-        let mut app = test_app();
-        let registry = HumanoidBoneRegistry(
-            [
-                (VrmBone::from("hips"), Name::new("J_Bip_C_Hips")),
-                (VrmBone::from("spine"), Name::new("J_Bip_C_Spine")),
-            ]
-            .into_iter()
-            .collect(),
-        );
-        let (model, root_bone) =
-            model_with_bones(&mut app, registry, &["J_Bip_C_Hips", "J_Bip_C_Spine"]);
-
-        app.world_mut()
-            .trigger(RequestInitializeHumanoidBones(model));
-        app.world_mut().flush();
-
-        let hips = app.world().get::<HipsBoneEntity>(model).unwrap().0;
-        assert!(app.world().get::<Hips>(hips).is_some());
-        assert_eq!(
-            app.world().get::<RestTransform>(hips).unwrap().0,
-            Transform::default()
-        );
-        assert!(app.world().get::<AnimationPlayer>(root_bone).is_some());
-        assert!(app.world().get::<SpineBoneEntity>(model).is_some());
-        success!()
-    }
-
-    /// A loadable but malformed VRM that declares no `hips` bone is skipped instead of
-    /// panicking. Used to abort on `registry.get(&VrmBone::from("hips")).unwrap()`.
-    #[test]
-    fn missing_hips_bone_is_skipped() -> TestResult {
-        let mut app = test_app();
-        let registry = HumanoidBoneRegistry(
-            [(VrmBone::from("spine"), Name::new("J_Bip_C_Spine"))]
-                .into_iter()
-                .collect(),
-        );
-        let (model, root_bone) = model_with_bones(&mut app, registry, &["J_Bip_C_Spine"]);
-
-        app.world_mut()
-            .trigger(RequestInitializeHumanoidBones(model));
-        app.world_mut().flush();
-
-        // Initialization was skipped as a whole, so no marker and no rest pose exist.
-        assert!(app.world().get::<HipsBoneEntity>(model).is_none());
-        assert!(app.world().get::<SpineBoneEntity>(model).is_none());
-        assert!(app.world().get::<AnimationPlayer>(root_bone).is_none());
-        let spine = app.world().get::<Children>(root_bone).unwrap()[0];
-        assert!(app.world().get::<Spine>(spine).is_none());
-        assert!(app.world().get::<RestTransform>(spine).is_none());
-        assert!(app.world().get::<RestGlobalTransform>(spine).is_none());
-        success!()
-    }
-
-    #[test]
-    fn snapshots_descendants_including_leaf_nodes_and_model_placement() {
-        let mut app = App::new();
-        app.add_observer(apply_insert_rest_transforms);
-        let placement = GlobalTransform::from(
-            Transform::from_xyz(5.0, 3.0, -2.0).with_rotation(Quat::from_rotation_y(0.7)),
-        );
-        let root = app
-            .world_mut()
-            .spawn((Transform::default(), placement))
-            .id();
-        let parent_local = Transform::from_xyz(0.0, 1.0, 0.0);
-        let parent_global = placement.mul_transform(parent_local);
-        let parent = app
-            .world_mut()
-            .spawn((parent_local, parent_global, ChildOf(root)))
-            .id();
-        let leaf_local =
-            Transform::from_xyz(0.2, 0.3, 0.0).with_rotation(Quat::from_rotation_z(0.4));
-        let leaf_global = parent_global.mul_transform(leaf_local);
-        let leaf = app
-            .world_mut()
-            .spawn((leaf_local, leaf_global, ChildOf(parent)))
-            .id();
-
-        app.world_mut()
-            .trigger(RequestInitializeHumanoidBones(root));
-        app.world_mut().flush();
-
-        assert_eq!(
-            app.world().get::<RestWorldTransform>(root).unwrap().0,
-            placement
-        );
-        for (entity, local, global) in [
-            (parent, parent_local, parent_global),
-            (leaf, leaf_local, leaf_global),
-        ] {
-            assert_eq!(app.world().get::<RestTransform>(entity).unwrap().0, local);
-            assert_eq!(
-                app.world().get::<RestGlobalTransform>(entity).unwrap().0,
-                global
-            );
-        }
-        // A later move must not rewrite the placement captured with the rest pose.
-        app.world_mut()
-            .entity_mut(root)
-            .insert(GlobalTransform::IDENTITY);
-        assert_eq!(
-            app.world().get::<RestWorldTransform>(root).unwrap().0,
-            placement
-        );
-    }
 }

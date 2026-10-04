@@ -1,4 +1,12 @@
 //!  This module handles the retargeting of expressions from a VRM model to a mascot model.
+//!
+//! The destination expressions are the load-time shape: the `.vrma` retarget
+//! writes [`VrmExpressionWeights`] on the VRM root through
+//! [`ExpressionWeightProperty`](crate::prelude::ExpressionWeightProperty), and
+//! [`apply_expression_morph_binds`](crate::prelude::apply_expression_morph_binds)
+//! — scheduled by [`VrmGltfPlugin`](crate::prelude::VrmGltfPlugin) — distributes
+//! them into the bound `MorphWeights`. There are no per-expression entities and
+//! no separate runtime expression pass to register.
 
 use crate::vrm::VrmExpression;
 use crate::vrma::gltf::extensions::VrmaExtensions;
@@ -12,8 +20,6 @@ impl Plugin for VrmaRetargetExpressionsPlugin {
         &self,
         _app: &mut App,
     ) {
-        // bind_expressions system is now registered in VrmExpressionPlugin
-        // so it works with or without VrmaPlugin.
     }
 }
 
@@ -39,82 +45,92 @@ impl VrmaExpressionNames {
 
 #[cfg(test)]
 mod tests {
-    use crate::tests::{TestResult, test_app};
+    use crate::success;
+    use crate::tests::TestResult;
     use crate::vrm::expressions::{
-        BindExpressionNode, ExpressionCategory, ExpressionCategoryTag, ExpressionOverride,
-        ExpressionOverrideSettings, ExpressionOverrideType, RetargetExpressionNodes,
-        VrmExpressionPlugin,
+        ExpressionCategory, ExpressionOverrideType, SetExpressions, VrmExpressionPlugin,
     };
+    use crate::vrma::animation::prelude::{
+        ExpressionMorphBinds, ExpressionSetting, ExpressionSettings, MorphBind, MorphBindTable,
+        VrmExpressionWeights, apply_expression_morph_binds,
+    };
+    use bevy::ecs::system::RunSystemOnce;
+    use bevy::mesh::morph::MorphWeights;
+    use bevy::platform::collections::HashMap;
     use bevy::prelude::*;
 
-    fn default_override_settings() -> ExpressionOverrideSettings {
-        ExpressionOverrideSettings {
-            override_mouth: ExpressionOverrideType::None,
-            override_blink: ExpressionOverrideType::None,
-            override_look_at: ExpressionOverrideType::None,
-        }
-    }
-
+    /// The pipeline shape, end to end for one expression: the `.vrma`
+    /// destination curve writes [`VrmExpressionWeights`], and the bind pass
+    /// moves it into the mesh's morph weights.
+    ///
+    /// This is the case `apply_regenerate_expression_clips` used to cover for the
+    /// per-expression-entity shape: the clip's expression curves reach the
+    /// avatar's morph targets without any intermediate entity.
     #[test]
-    fn test_bind_expressions_prefers_override() -> TestResult {
-        let mut app = test_app();
+    fn a_retargeted_expression_weight_reaches_the_morph_target() -> TestResult {
+        let mut app = crate::tests::test_app();
         app.add_plugins(VrmExpressionPlugin);
 
-        let mesh_entity = app
+        let mesh = app
             .world_mut()
-            .spawn(MorphWeights::new(vec![0.0], None)?)
+            .spawn(MorphWeights::new(vec![0.0, 0.0], None)?)
+            .id();
+        let root = app
+            .world_mut()
+            .spawn((
+                VrmExpressionWeights(HashMap::from([("happy".to_owned(), 0.0)])),
+                ExpressionMorphBinds(MorphBindTable(HashMap::from([(
+                    "happy".to_owned(),
+                    vec![MorphBind {
+                        target: mesh,
+                        index: 1,
+                        weight: 1.0,
+                    }],
+                )]))),
+                ExpressionSettings(HashMap::from([(
+                    "happy".to_owned(),
+                    ExpressionSetting {
+                        is_binary: false,
+                        category: ExpressionCategory::Other,
+                        override_blink: ExpressionOverrideType::None,
+                        override_look_at: ExpressionOverrideType::None,
+                        override_mouth: ExpressionOverrideType::None,
+                    },
+                )])),
+            ))
             .id();
 
-        app.world_mut().spawn((
-            Transform::from_translation(Vec3::new(0.3, 0.0, 0.0)),
-            RetargetExpressionNodes(vec![BindExpressionNode {
-                expression_entity: mesh_entity,
-                index: 0,
-                weight: 1.0,
-            }]),
-            ExpressionCategoryTag(ExpressionCategory::Other),
-            default_override_settings(),
-            ExpressionOverride(0.9),
-        ));
-        app.update();
+        // The retarget's weight, as an animation curve or an
+        // `ExpressionWeightProperty` writes it.
+        app.world_mut()
+            .entity_mut(root)
+            .get_mut::<VrmExpressionWeights>()
+            .expect("the root carries the weights")
+            .0
+            .insert("happy".to_owned(), 0.6);
+        app.world_mut()
+            .run_system_once(apply_expression_morph_binds)
+            .expect("the bind pass runs");
 
-        let morph = app.world().get::<MorphWeights>(mesh_entity).unwrap();
-        assert!(
-            (morph.weights()[0] - 0.9).abs() < f32::EPSILON,
-            "Expected override value 0.9, got {}",
-            morph.weights()[0]
+        assert_eq!(
+            app.world().get::<MorphWeights>(mesh).unwrap().weights()[1],
+            0.6
         );
-        Ok(())
-    }
 
-    #[test]
-    fn test_bind_expressions_falls_back_to_transform() -> TestResult {
-        let mut app = test_app();
-        app.add_plugins(VrmExpressionPlugin);
-
-        let mesh_entity = app
-            .world_mut()
-            .spawn(MorphWeights::new(vec![0.0], None)?)
-            .id();
-
-        app.world_mut().spawn((
-            Transform::from_translation(Vec3::new(0.5, 0.0, 0.0)),
-            RetargetExpressionNodes(vec![BindExpressionNode {
-                expression_entity: mesh_entity,
-                index: 0,
-                weight: 1.0,
-            }]),
-            ExpressionCategoryTag(ExpressionCategory::Other),
-            default_override_settings(),
-        ));
+        // A user trigger on the same root wins over the retargeted weight, which
+        // is what makes an expression overridable at runtime.
+        app.world_mut()
+            .commands()
+            .trigger(SetExpressions::single(root, "happy", 0.25));
         app.update();
+        app.world_mut()
+            .run_system_once(apply_expression_morph_binds)
+            .expect("the bind pass runs");
 
-        let morph = app.world().get::<MorphWeights>(mesh_entity).unwrap();
-        assert!(
-            (morph.weights()[0] - 0.5).abs() < f32::EPSILON,
-            "Expected VRMA value 0.5, got {}",
-            morph.weights()[0]
+        assert_eq!(
+            app.world().get::<MorphWeights>(mesh).unwrap().weights()[1],
+            0.25
         );
-        Ok(())
+        success!()
     }
 }

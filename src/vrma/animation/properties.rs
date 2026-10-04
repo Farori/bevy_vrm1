@@ -249,8 +249,7 @@ fn expression_output_weight(
 
 /// Applies [`VrmExpressionWeights`] to the bound `MorphWeights`.
 ///
-/// Mirrors the runtime expression pipeline of
-/// `vrm::expressions::bind_expressions`, in three passes:
+/// The expression pipeline of a `.vrm`, in three passes:
 ///
 /// 1. every expression's output weight (`isBinary` threshold, else clamp) is
 ///    computed, and **one rate per category** is accumulated over all

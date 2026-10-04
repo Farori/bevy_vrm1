@@ -8,18 +8,17 @@ use bevy::window::Window;
 use std::collections::HashMap;
 
 /// Optional body tracking that makes head, neck, chest, and spine bones
-/// follow the `LookAt` target. Insert alongside [`LookAt`] to enable.
+/// follow the `LookAt` target. Insert it alongside [`LookAt`] inside
+/// [`spawn_vrm`]'s `configure` closure, which is handed the VRM root.
 ///
 /// ```no_run
 /// use bevy::prelude::*;
 /// use bevy_vrm1::prelude::*;
 ///
-/// fn spawn(mut commands: Commands, asset_server: Res<AssetServer>) {
-///     commands.spawn((
-///         VrmHandle(asset_server.load("model.vrm")),
-///         LookAt::Cursor,
-///         BodyTracking::default(),
-///     ));
+/// fn spawn(mut commands: Commands) {
+///     spawn_vrm(&mut commands, "model.vrm", |root| {
+///         root.insert((LookAt::Cursor, BodyTracking::default()));
+///     });
 /// }
 /// ```
 #[derive(Component, Debug, Clone, Reflect)]

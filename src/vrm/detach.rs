@@ -2,17 +2,8 @@ use crate::vrm::body_tracking::{BodyTracking, SmoothedGaze};
 use crate::vrm::components::{
     ConstraintExecutionOrder, PendingNodeConstraint, VrmHeadOnly, VrmNodeConstraint, VrmNodeIndex,
 };
-use crate::vrm::expressions::{ExpressionEntityMap, VrmExpressionRegistry};
-use crate::vrm::first_person::FirstPersonRegistry;
 use crate::vrm::gltf::extensions::vrmc_vrm::LookAtProperties;
-use crate::vrm::humanoid_bone::HumanoidBoneRegistry;
-use crate::vrm::loader::VrmHandle;
 use crate::vrm::look_at::LookAt;
-use crate::vrm::mtoon::VrmcMaterialRegistry;
-use crate::vrm::node_constraint::registry::NodeConstraintRegistry;
-use crate::vrm::spring_bone::registry::{
-    SpringColliderRegistry, SpringJointPropsRegistry, SpringNodeRegistry,
-};
 use crate::vrm::spring_bone::{SpringJointProps, SpringJointState, SpringRoot};
 use crate::vrm::{
     Initialized, RestGlobalTransform, RestTransform, RestWorldTransform, Vrm, VrmBone, VrmPath,
@@ -30,19 +21,14 @@ use bevy::world_serialization::{WorldAsset, WorldAssetRoot};
 ///
 /// # Which entity is "the VRM root"
 ///
-/// Both load paths put the VRM components on the entity that owns the mesh
-/// hierarchy, and both write [`Vrm`] onto it, so triggering this there works for
-/// either:
-///
-/// * **legacy** — `spawn_vrm` writes `Vrm` on the entity that carried the
-///   [`VrmHandle`](crate::prelude::VrmHandle), and the scene is instantiated
-///   *below* it as a [`WorldAssetRoot`];
-/// * **load-time pipeline** — the scene root is instantiated as a *child* of
-///   the [`WorldAssetRoot`] entity the application spawned
-///   (`bevy_world_serialization`'s `set_instance_parent_sync`), and
-///   `handler::scene::mark_initialized` is what wrote `Vrm` on it. Triggering
-///   this on the [`WorldAssetRoot`] entity itself finds neither `Vrm` nor
-///   `VrmHandle` there and is a no-op.
+/// Trigger this on the scene root the load-time pipeline created — the entity
+/// carrying [`Vrm`] and [`Initialized`], which is instantiated as a *child* of
+/// the [`WorldAssetRoot`] entity the application spawned
+/// (`bevy_world_serialization`'s `set_instance_parent_sync`).
+/// `handler::scene::mark_initialized` is what wrote both markers on it.
+/// Triggering this on the [`WorldAssetRoot`] entity itself finds no [`Vrm`]
+/// there and is a no-op; [`spawn_vrm`](crate::prelude::spawn_vrm) hands you
+/// the right entity in its `configure` closure.
 ///
 /// # Usage
 ///
@@ -71,14 +57,13 @@ fn apply_detach_vrm(
     trigger: On<RequestDetachVrm>,
     mut commands: Commands,
     children_query: Query<&Children>,
-    vrm_check: Query<(), Or<(With<Vrm>, With<VrmHandle>)>>,
+    vrm_check: Query<(), With<Vrm>>,
 ) {
     let entity = trigger.event_target();
 
     // `Vrm` is what a pipeline scene root carries (`handler::scene`'s
-    // `mark_initialized`); `VrmHandle` is what the legacy entity carries until
-    // `spawn_vrm` has swapped it for `Vrm`. Both are accepted, so the guard
-    // holds for either path.
+    // `mark_initialized`), and it is the only marker that says "this entity
+    // owns a VRM mesh hierarchy".
     if vrm_check.get(entity).is_err() {
         return;
     }
@@ -89,43 +74,31 @@ fn apply_detach_vrm(
 
 /// Removes all VRM-related components from the entity.
 ///
-/// # Both load paths have to be covered
+/// The list is the load-time inventory, in the two places the pipeline writes
+/// it: `handler::scene::finalize` puts the first group on the scene *root*
+/// inside the asset, and `handler::nodes::process_node`,
+/// `resolve_constraints`, `build_spring_chains` and `spawn_head_copies` put the
+/// second group on the individual nodes.
 ///
-/// A VRM reaches this function in one of two shapes, and the removal used to
-/// only know about the first:
-///
-/// * the **legacy** path, where `spawn_vrm` (`src/vrm/initialize.rs:70-117`)
-///   writes the registries, the `VrmPath` and the `WorldAssetRoot` onto the
-///   `VrmHandle` entity, and the per-bone holders on top of those;
-/// * the **load-time pipeline**, where `handler::scene::finalize` writes
-///   [`ConstraintExecutionOrder`], the three expression property components,
-///   [`Vrm`] and [`Initialized`] onto the scene root *inside the asset* while
-///   the file loads, and `handler::nodes::process_node`,
-///   `resolve_constraints`, `build_spring_chains` and `spawn_head_copies` write
-///   the per-node set onto the nodes.
-///
-/// The one that actually leaked is [`ConstraintExecutionOrder`]: it lives on the
+/// The one that actually leaks is [`ConstraintExecutionOrder`]: it lives on the
 /// root, `apply_node_constraints` (`src/vrm/runtime.rs`) iterates every entity
 /// that has one on every frame, and a root that kept it stayed in that query for
 /// the rest of the app's life.
 ///
-/// Every removal is a `try_remove`, so the two shapes can be handled by one
-/// list: a component a given entity never had — a pipeline root has no
-/// [`VrmPath`], which only the legacy loader writes — costs nothing and needs no
-/// `if let`.
+/// Every removal is a `try_remove`, so the one list covers both a root and a
+/// node: a component a given entity never had — a mesh node has no `VrmPath`,
+/// which only `handler::scene::insert_source_path` writes, and only on the
+/// root — costs nothing and needs no `if let`.
 ///
 /// # Rest transforms: removed from the target only, deliberately
 ///
 /// `insert_rest_transforms` (`handler::scene`) puts [`RestTransform`] and
 /// [`RestGlobalTransform`] on *every* entity of a pipeline scene and
-/// [`RestWorldTransform`] on its root; the legacy path put the bone ones on the
-/// bone entities. This function removes all three from the target only, and the
-/// rest of the skeleton is left to `despawn_children`, which despawns those
-/// entities outright. Nothing survives for a later system to act on, and the
-/// mesh hierarchy that is left behind is an ordinary skinned scene with its
-/// bones — which is exactly what a "plain glTF scene" means here. Removing the
-/// rest components recursively as well would buy nothing and would stop being
-/// able to claim the same policy as the legacy path.
+/// [`RestWorldTransform`] on its root. This function removes all three from the
+/// target only, and the rest of the skeleton is left to `despawn_children`,
+/// which despawns those entities outright. Nothing survives for a later system
+/// to act on, and the mesh hierarchy that is left behind is an ordinary skinned
+/// scene with its bones — which is exactly what a "plain glTF scene" means here.
 fn remove_vrm_components(
     commands: &mut Commands,
     entity: Entity,
@@ -136,7 +109,6 @@ fn remove_vrm_components(
         .try_remove::<Vrm>()
         .try_remove::<VrmPath>()
         .try_remove::<Initialized>()
-        .try_remove::<VrmHandle>()
         .try_remove::<Name>()
         // Removing `WorldAssetRoot` runs bevy's `on_remove` hook, which
         // unregisters the instance from its `WorldInstanceSpawner`.
@@ -145,25 +117,13 @@ fn remove_vrm_components(
         .try_remove::<RestTransform>()
         .try_remove::<RestGlobalTransform>()
         .try_remove::<RestWorldTransform>()
-        // Registries (pub)
-        .try_remove::<VrmcMaterialRegistry>()
-        .try_remove::<NodeConstraintRegistry>()
-        .try_remove::<ExpressionEntityMap>()
-        // Registries (pub(crate))
-        .try_remove::<VrmExpressionRegistry>()
-        .try_remove::<HumanoidBoneRegistry>()
-        .try_remove::<SpringJointPropsRegistry>()
-        .try_remove::<SpringColliderRegistry>()
-        .try_remove::<SpringNodeRegistry>()
-        .try_remove::<FirstPersonRegistry>()
         // Gaze/Body
         .try_remove::<LookAtProperties>()
         .try_remove::<LookAt>()
         .try_remove::<BodyTracking>()
         .try_remove::<SmoothedGaze>()
         // Node identity. `VrmNodeIndex` and `VrmBone` come from
-        // `handler::nodes::process_node`, `VrmBone` also from the legacy
-        // `apply_initialize_humanoid_bones`.
+        // `handler::nodes::process_node`.
         .try_remove::<VrmNodeIndex>()
         .try_remove::<VrmBone>()
         // Node constraints. `PendingNodeConstraint` is normally resolved away by
@@ -175,7 +135,7 @@ fn remove_vrm_components(
         // root stays in `apply_node_constraints`' query for the rest of the
         // app's life.
         .try_remove::<ConstraintExecutionOrder>()
-        // Expressions, load-time pipeline shape.
+        // Expressions.
         .try_remove::<VrmExpressionWeights>()
         .try_remove::<ExpressionMorphBinds>()
         .try_remove::<ExpressionSettings>()
@@ -368,12 +328,7 @@ mod tests {
 
         let vrm_entity = app
             .world_mut()
-            .spawn((
-                Vrm,
-                Initialized,
-                ExpressionEntityMap(HashMap::default()),
-                RestWorldTransform::default(),
-            ))
+            .spawn((Vrm, Initialized, RestWorldTransform::default()))
             .id();
 
         app.world_mut()
@@ -385,7 +340,6 @@ mod tests {
         let world = app.world();
         assert!(!world.entity(vrm_entity).contains::<Vrm>());
         assert!(!world.entity(vrm_entity).contains::<Initialized>());
-        assert!(!world.entity(vrm_entity).contains::<ExpressionEntityMap>());
         assert!(!world.entity(vrm_entity).contains::<RestWorldTransform>());
         // Entity itself survives
         assert!(world.get_entity(vrm_entity).is_ok());
@@ -570,23 +524,21 @@ mod tests {
         success!()
     }
 
-    /// The legacy set, so the load-time additions did not quietly narrow it:
-    /// `spawn_vrm` (`src/vrm/initialize.rs:70-117`) writes the registries and
-    /// `VrmPath`, `apply_initialize_humanoid_bones` adds a bone holder and
-    /// `apply_initialize_expressions` adds `ExpressionEntityMap`.
+    /// The root-side set, so the node-side list above did not quietly narrow it:
+    /// `handler::scene::insert_source_path` writes `VrmPath` on the scene root,
+    /// `insert_humanoid_bone_holders` puts a bone holder on it, and `LookAt` /
+    /// `BodyTracking` are what [`spawn_vrm`]'s `configure` closure inserts.
     ///
-    /// `VrmPath` is the asymmetry worth pinning: only `spawn_vrm` writes it, and
-    /// only when `handle.0.path()` is `Some`, so neither the legacy root nor a
-    /// pipeline root is guaranteed to have one. The removal is a `try_remove`
-    /// precisely so the absent case needs no branch of its own.
+    /// `VrmPath` is the asymmetry worth pinning: only `insert_source_path`
+    /// writes it, and only on the root, so a mesh node is not guaranteed to have
+    /// one. The removal is a `try_remove` precisely so the absent case needs no
+    /// branch of its own.
     #[test]
-    fn the_legacy_component_set_is_still_removed() -> TestResult {
+    fn the_root_side_component_set_is_removed() -> TestResult {
         let mut app = setup_app();
         let hips = app.world_mut().spawn_empty().id();
         let root = app.world_mut().spawn_empty().id();
 
-        // `NodeConstraintRegistry` is the one component whose map is a
-        // `std::collections::HashMap` rather than bevy's, so it is spelled out.
         app.world_mut().entity_mut(root).insert((
             Vrm,
             Initialized,
@@ -595,19 +547,11 @@ mod tests {
             VrmPath::new("vrm/Elmer.vrm"),
             RestWorldTransform::default(),
             LookAtProperties::default(),
+            // User-inserted through `spawn_vrm`'s `configure` closure.
             LookAt::Cursor,
-            VrmcMaterialRegistry::default(),
-            NodeConstraintRegistry(std::collections::HashMap::default()),
-            VrmExpressionRegistry(HashMap::default()),
-            ExpressionEntityMap(HashMap::default()),
+            BodyTracking::default(),
+            SmoothedGaze::default(),
             HipsBoneEntity(hips),
-        ));
-        app.world_mut().entity_mut(root).insert((
-            HumanoidBoneRegistry::default(),
-            SpringJointPropsRegistry::default(),
-            SpringColliderRegistry::default(),
-            SpringNodeRegistry::default(),
-            FirstPersonRegistry::default(),
         ));
 
         trigger_detach(&mut app, root);
@@ -622,17 +566,10 @@ mod tests {
             WorldAssetRoot,
             VrmPath,
             RestWorldTransform,
-            VrmcMaterialRegistry,
-            NodeConstraintRegistry,
-            VrmExpressionRegistry,
-            ExpressionEntityMap,
-            HumanoidBoneRegistry,
-            SpringJointPropsRegistry,
-            SpringColliderRegistry,
-            SpringNodeRegistry,
-            FirstPersonRegistry,
             LookAtProperties,
             LookAt,
+            BodyTracking,
+            SmoothedGaze,
             HipsBoneEntity,
         );
         // The bone entity was never the target, and only VRM components are
@@ -707,9 +644,10 @@ mod tests {
         success!()
     }
 
-    /// The absence of `VrmPath` is the normal case on the pipeline path, where
-    /// only the legacy `spawn_vrm` writes it — and only when the handle carries a
-    /// path at all. Detaching a pipeline scene must not panic on it.
+    /// `VrmPath` is only on the scene *root* that
+    /// `handler::scene::insert_source_path` wrote it on, so it is not a component
+    /// every VRM entity is guaranteed to carry. Detaching one without it must not
+    /// panic — the removal is a `try_remove` precisely for that.
     #[test]
     fn detaching_a_scene_without_a_vrm_path_is_fine() -> TestResult {
         let mut app = setup_app();
@@ -721,6 +659,30 @@ mod tests {
         trigger_detach(&mut app, root);
 
         assert!(app.world().get_entity(root).is_ok());
+        success!()
+    }
+
+    /// The `Vrm` guard is what scopes a detach: an entity that does not own a
+    /// VRM mesh hierarchy is left completely alone, even when it carries
+    /// components that appear on the removal list.
+    #[test]
+    fn detaching_an_entity_without_vrm_is_a_no_op() -> TestResult {
+        let mut app = setup_app();
+        let node = app
+            .world_mut()
+            .spawn((
+                VrmNodeIndex(3),
+                VrmBone::from("hips"),
+                RestTransform::default(),
+            ))
+            .id();
+
+        trigger_detach(&mut app, node);
+
+        assert!(
+            app.world().get::<VrmBone>(node).is_some(),
+            "a node without `Vrm` is not a VRM root and must not be stripped"
+        );
         success!()
     }
 }

@@ -5,17 +5,16 @@
 //! `on_spawn_mesh_and_material` then swaps out the `StandardMaterial` that
 //! `GltfExtensionHandlerPbr` put on the mesh entity.
 //!
-//! # Why the swap replaces the legacy `turn_to_mtoon_material`
+//! # Why the conversion happens here, and not on `Added<MeshMaterial3d>`
 //!
-//! `src/vrm/mtoon/setup.rs` watches for `Added<MeshMaterial3d<StandardMaterial>>`
-//! and looks the `VRMC_materials_mtoon` payload up in a
-//! [`VrmcMaterialRegistry`](crate::vrm::mtoon::VrmcMaterialRegistry). That filter
-//! is a one-shot: if the `StandardMaterial` asset is not in `Assets` yet when the
-//! component appears, `Assets::<StandardMaterial>::get` returns `None`, the
-//! entity is skipped, and it is never revisited — so the conversion is silently
-//! lost for any load where the material resolves late. Doing the conversion
-//! here removes the race by construction: the material *is* the glTF material
-//! at this point in the load.
+//! Watching for `Added<MeshMaterial3d<StandardMaterial>>` and looking the
+//! `VRMC_materials_mtoon` payload up in a registry keyed by `StandardMaterial`
+//! handle is a one-shot filter: if the `StandardMaterial` asset is not in
+//! `Assets` yet when the component appears, `Assets::<StandardMaterial>::get`
+//! returns `None`, the entity is skipped, and it is never revisited — so the
+//! conversion is silently lost for any load where the material resolves late.
+//! Doing the conversion here removes the race by construction: the material *is*
+//! the glTF material at this point in the load.
 //!
 //! # Where the values come from
 //!
@@ -26,7 +25,7 @@
 //!   `bevy_gltf` at `crates/bevy_gltf/src/loader/mod.rs:1414-1415`. It is
 //!   multiplied here by the one factor that is still missing,
 //!   `VRMC_materials_hdr_emissiveMultiplier`, so each extension applies exactly
-//!   once — the same composition `mtoon/setup.rs` performs.
+//!   once.
 //! * `uv_transform` is the `KHR_texture_transform` of the base color texture,
 //!   the only one `bevy_gltf` reads
 //!   (`crates/bevy_gltf/src/loader/mod.rs:1274-1277`; see the extension table in
@@ -36,11 +35,10 @@
 //! * `cull_mode`, `alpha_mode` and `double_sided` likewise.
 //!
 //! Because `GltfMaterial` declares neither a depth bias nor an opaque render
-//! method, both are the `StandardMaterial` defaults — which is also what
-//! `bevy_pbr`'s own `GltfMaterial` -> `StandardMaterial` conversion produces
-//! (`crates/bevy_pbr/src/gltf.rs:97`) and therefore what the legacy
-//! `mtoon/setup.rs` copies. They are named explicitly here so the two paths
-//! cannot drift apart.
+//! method, both are written as the `StandardMaterial` defaults — which is also
+//! what `bevy_pbr`'s own `GltfMaterial` -> `StandardMaterial` conversion
+//! produces (`crates/bevy_pbr/src/gltf.rs:97`). They are named explicitly rather
+//! than left to a `Default`, so a future bevy default change is visible here.
 
 use bevy::asset::{Handle, LoadContext};
 use bevy::ecs::world::EntityWorldMut;
@@ -92,7 +90,8 @@ pub(crate) fn process_material(
         // The crate's shader has no screen-space outline
         // (`OutlineWidthMode::None` is the only other variant,
         // `src/vrm/mtoon/material/outline.rs:46`), so this is the same silent
-        // downgrade the legacy conversion performs — now said out loud.
+        // downgrade the spec would otherwise ask for, and it is the
+        // conservative direction — now said out loud.
         vrm_warn!(format!(
             "VRM MToon: `{material_label}` requests a screenCoordinates outline, which is not \
              supported; drawing no outline instead"

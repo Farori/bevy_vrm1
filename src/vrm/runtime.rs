@@ -3,48 +3,17 @@
 //! The load-time handler writes node constraints into the scene `WorldAsset` as
 //! [`ConstraintExecutionOrder`] (on the scene root) plus [`VrmNodeConstraint`]
 //! (on each destination), so the evaluation *order* is data rather than schedule
-//! configuration. [`apply_node_constraints`] is the whole runtime surface today:
+//! configuration. [`apply_node_constraints`] is the whole runtime surface:
 //! one ordered pass over that list, driven by no registry and no
 //! `Changed<Transform>` trigger.
 //!
-//! # Why a pipeline scene is never evaluated twice
+//! # Why this is the only node-constraint evaluator
 //!
-//! The legacy `VrmNodeConstraintPlugin` path stays in the tree until it is
-//! removed, and its three `bind_*` systems live in the same
-//! [`VrmSystemSets::Constraints`] set as [`apply_node_constraints`]. They cannot
-//! see a pipeline scene, and the reason is a component, not archetype luck:
-//!
-//! * `bind_rotation_constraints` / `bind_roll_constraints` /
-//!   `bind_aim_constraints` iterate sources carrying
-//!   `RotationConstraintDestinations` / `RollConstraintDestinations` /
-//!   `AimConstraintDestinations` (`src/vrm/node_constraint/bind/rotation.rs:26`,
-//!   `roll.rs:24`, `aim.rs:24`). Those components are inserted from exactly one
-//!   place: `register_rotation_constraint` and friends in
-//!   `src/vrm/node_constraint/initialize.rs:105`, `:133`, `:159`, which are
-//!   reached only from the `RequestInitializeNodeConstraints` observer.
-//! * That observer bails out at `src/vrm/node_constraint/initialize.rs:33`
-//!   unless the root carries `NodeConstraintRegistry`.
-//! * `NodeConstraintRegistry` is inserted in exactly one place:
-//!   `src/vrm/initialize.rs:82`, inside `spawn_vrm`, whose only trigger is the
-//!   `VrmHandle` component. A pipeline scene is spawned from a
-//!   `WorldAssetRoot` and never has a `VrmHandle`, so the registry never
-//!   exists and the observer never inserts the three destination lists.
-//!
-//! The converse also holds and is what this system relies on: it reads nothing
-//! but `ConstraintExecutionOrder`, `VrmNodeConstraint`, `RestTransform`,
-//! `ChildOf` and `Transform`, none of which the legacy initializer writes. The
-//! two paths are disjoint in both directions.
-//!
-//! One residue until the legacy path is deleted: the scheduler sees
-//! `apply_node_constraints` as a `Transform` *writer* and the legacy `bind_*`
-//! systems as `Transform` *readers*, both unordered inside the same set, so
-//! enabling `ScheduleBuildSettings::ambiguity_detection` would report the pair.
-//! Nothing is written twice — the legacy source queries match no entity on a
-//! pipeline scene — and bevy's default is `LogLevel::Ignore`
-//! (`bevy_ecs/src/schedule/schedule.rs:1627`). The private `fn`s in
-//! `src/vrm/node_constraint/bind/` cannot be named from here to declare the
-//! ambiguity, so it goes away with the legacy path rather than being papered
-//! over.
+//! The three constraints `VRMC_node_constraint` defines are read straight off
+//! the glTF nodes by the handler (`handler::nodes::resolve_constraints`), which
+//! resolves every reference while the entities that satisfy it are still in the
+//! loader's world. There is nothing left for a runtime system to look up by
+//! name, so there is no second evaluator to keep consistent with this one.
 
 use crate::system_set::VrmSystemSets;
 use crate::vrm::RestTransform;
@@ -78,7 +47,7 @@ impl Plugin for VrmGltfRuntimePlugin {
         // eyes — the established manual-propagation order, unchanged.
         //
         // `.after(AnimationSystems)` because the sources are humanoid bones
-        // driven by `AnimationPlayer`, matching the legacy bind systems.
+        // driven by `AnimationPlayer`.
         // `.before(TransformSystems::Propagate)` because this system writes
         // `Transform` and bevy's propagation reads it; the constraint step
         // must be done before the engine publishes globals, and bevy already
@@ -222,11 +191,9 @@ fn roll_rotation(
     // Spec pseudocode:
     //   deltaSrcQuatInParent = srcRestQuat * deltaSrcQuat * srcRestQuat^-1
     //   deltaSrcQuatInDst    = dstRestQuat^-1 * deltaSrcQuatInParent * dstRestQuat
-    // The first line conjugates by the *source's* rest rotation. That is the
-    // fix the legacy `bind_roll_constraints` carries
-    // (`src/vrm/node_constraint/bind/roll.rs:37`); conjugating by
-    // `destination_rest` instead would rotate the delta through the wrong
-    // basis.
+    // The first line conjugates by the *source's* rest rotation;
+    // conjugating by `destination_rest` instead would rotate the delta through
+    // the wrong basis.
     let delta_in_parent = source_rest * source_delta * source_rest.inverse();
     let delta_in_destination = destination_rest.inverse() * delta_in_parent * destination_rest;
 
@@ -266,11 +233,10 @@ fn aim_rotation(
     let destination_local = *transforms.get(destination).ok()?;
     let destination_global = destination_parent.mul_transform(destination_local);
 
-    // `toVec = (srcWorldPos - dstWorldPos).normalized`. Upstream's legacy
-    // `bind_aim_constraints` calls a bare `Vec3::normalize()` here
-    // (`src/vrm/node_constraint/bind/aim.rs:37`), which is `NaN` when the
-    // source and the destination coincide — a configuration a sleeve bone and
-    // a hand bone reach whenever the arm is at the origin. There is no
+    // `toVec = (srcWorldPos - dstWorldPos).normalized`. A bare `Vec3::normalize()`
+    // here would be `NaN` when the source and the destination coincide — a
+    // configuration a sleeve bone and a hand bone reach whenever the arm is at
+    // the origin — and the `NaN` would be written into the scene. There is no
     // direction to aim at, so the constraint is skipped instead.
     let to_vec = (source_global.translation - destination_global.translation).normalize_or_zero();
     if to_vec == Vec3::ZERO {
@@ -343,7 +309,6 @@ mod tests {
     use super::*;
     use crate::success;
     use crate::tests::{TestResult, test_app};
-    use crate::vrm::node_constraint::{RotationConstraintDest, RotationConstraintDestinations};
     use bevy::ecs::system::RunSystemOnce;
     use bevy::transform::TransformPlugin;
     use bevy::transform::systems::{propagate_parent_transforms, sync_simple_transforms};
@@ -530,7 +495,7 @@ mod tests {
 
         let expected = spec_roll(source_rest, source_delta, destination_rest, roll_axis, 1.0);
         // The same formula with the destination's rest rotation where the
-        // source's belongs: the bug the legacy `e45bb21` fix corrected.
+        // source's belongs: the bug the roll basis must not reintroduce.
         let wrong_basis = spec_roll(
             destination_rest,
             source_delta,
@@ -604,9 +569,8 @@ mod tests {
         success!()
     }
 
-    /// The legacy `bind_aim_constraints` normalizes a zero-length vector here
-    /// (`src/vrm/node_constraint/bind/aim.rs:37`) and writes the resulting
-    /// `NaN` quaternion into the scene.
+    /// Normalizing a zero-length vector would produce the `NaN` quaternion this
+    /// test pins the absence of.
     #[test]
     fn aim_constraint_skips_a_destination_coincident_with_its_source() -> TestResult {
         let mut app = test_app();
@@ -765,12 +729,12 @@ mod tests {
         success!()
     }
 
-    /// The legacy bind systems key off `RotationConstraintDestinations`; this
-    /// one keys off `ConstraintExecutionOrder`. With the legacy list present
-    /// and no execution order, nothing must move — that is the disjointness the
-    /// module docs argue from, seen from this side.
+    /// Nothing but the execution order starts this system: a `VrmNodeConstraint`
+    /// with no order listing its entity is left alone. The order is what
+    /// `handler::scene::resolve_constraints` computed at load time, and it is the
+    /// only input that says a destination is part of a scene.
     #[test]
-    fn the_legacy_destination_registries_do_not_drive_this_system() -> TestResult {
+    fn only_the_execution_order_drives_this_system() -> TestResult {
         let mut app = test_app();
         let source = app
             .world_mut()
@@ -788,22 +752,14 @@ mod tests {
                 },
             ))
             .id();
-        // Exactly what `register_rotation_constraint` would have inserted.
-        app.world_mut()
-            .entity_mut(source)
-            .insert(RotationConstraintDestinations(vec![
-                RotationConstraintDest {
-                    dest: destination,
-                    weight: 1.0,
-                },
-            ]));
         set_rotation(&mut app, source, Quat::from_rotation_x(FRAC_PI_2));
 
+        // No entity carries `ConstraintExecutionOrder` yet.
         run_constraints(&mut app);
         assert_eq!(
             rotation(&app, destination),
             Quat::IDENTITY,
-            "a legacy registry must not drive the pipeline system"
+            "a destination the execution order does not name must not move"
         );
 
         // The execution order is the only thing that starts it.

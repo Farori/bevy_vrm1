@@ -1,4 +1,3 @@
-use crate::vrm::humanoid_bone::HumanoidBoneRegistry;
 use crate::vrm::{Vrm, VrmBone};
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
@@ -47,16 +46,6 @@ impl ChildSearcher<'_, '_> {
         target_name: &VrmBone,
     ) -> Option<Entity> {
         find_entity(target_name, true, root, &self.entities)
-    }
-
-    pub(crate) fn has_been_spawned_all_bones(
-        &self,
-        root: Entity,
-        bone_registry: &HumanoidBoneRegistry,
-    ) -> bool {
-        bone_registry
-            .values()
-            .all(|bone_name| self.find_from_name(root, bone_name.as_str()).is_some())
     }
 }
 

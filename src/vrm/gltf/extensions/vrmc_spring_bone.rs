@@ -80,11 +80,11 @@ pub struct Spring {
 /// Every property but `node` is optional in the specification and carries a
 /// documented default. An absent property is materialised as `Some(default)`
 /// rather than left as `None`, because the consumer
-/// ([`crate::vrm::spring_bone::registry::SpringJointPropsRegistry`]) reads all
-/// five through `Option`, and a single `None` makes it discard the joint
-/// entirely — a hair strand that stops simulating because the exporter left
-/// out `stiffness`. An explicit `null` is not a valid `number` in the schema
-/// and still yields `None`.
+/// ([`build_spring_chains`](crate::vrm::gltf::handler::scene)) reads all five
+/// through `Option`, and a single `None` makes it discard the joint entirely — a
+/// hair strand that stops simulating because the exporter left out `stiffness`.
+/// An explicit `null` is not a valid `number` in the schema and still yields
+/// `None`.
 #[derive(Serialize, Deserialize, Copy, Clone, Debug)]
 pub struct SpringJoint {
     pub node: usize,

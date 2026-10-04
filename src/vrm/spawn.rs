@@ -32,9 +32,8 @@
 //! (`bevy_ecs/src/event/trigger.rs:146`). Registering the observer per entity is
 //! what makes this match *one* instance: a global observer, or a system on
 //! `Added<Initialized>`, would also fire for a second avatar in the same app, and
-//! [`Initialized`] is not unique to this pipeline — the legacy loader inserts the
-//! same marker from `src/vrm/initialize.rs:143`, and the `.vrma` runtime keys on
-//! it too (`src/vrma/initialize.rs:118-121`).
+//! a `.vrma` source rig keys on `Initialized` too
+//! (`src/vrma/initialize.rs:118-121`).
 //!
 //! `set_instance_parent_sync` has already run when the event is delivered
 //! (`world_asset_spawner.rs:633-642`), so the VRM root is a child of the spawned
@@ -61,13 +60,11 @@
 //! [`warn_never_ready`] and its pending closure is dropped — never a panic and
 //! never a leaked closure.
 //!
-//! # Relationship to the legacy loader
+//! # Requirement
 //!
-//! This is the supported way to spawn a VRM. The legacy
-//! [`VrmHandle`](crate::prelude::VrmHandle) path is removed by a follow-up
-//! commit; until then it still works, and
-//! [`VrmGltfPlugin`](crate::prelude::VrmGltfPlugin) documents which plugin set
-//! each path needs.
+//! [`VrmGltfPlugin`](crate::prelude::VrmGltfPlugin) has to be in the app: it is
+//! the only plugin that claims the `vrm` extension, and it is what writes
+//! [`Initialized`] into the scene asset this call loads.
 
 use bevy::asset::AssetServer;
 use bevy::ecs::world::World;
@@ -199,8 +196,8 @@ fn configure_ready_vrm(
         return;
     };
     spawn.frames_waited = 0;
-    // Scoped to this instance's own children, so another avatar's root, a legacy
-    // `VrmHandle` root and a legacy `.vrma` root cannot be picked up.
+    // Scoped to this instance's own children, so another avatar's root and a
+    // `.vrma` source rig cannot be picked up.
     let candidates: Vec<Entity> = children
         .get(parent)
         .into_iter()

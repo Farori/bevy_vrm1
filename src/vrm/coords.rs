@@ -25,9 +25,10 @@
 //!
 //! Both conversion flags are off by default — see
 //! [`bevy::gltf::convert_coordinates::GltfConvertCoordinates`], whose fields
-//! default to `false` — which is what vanilla `bevy_gltf` does and what this
-//! crate's legacy loader did. Switching the default would silently rotate every
-//! already-working avatar, so the orientation is *described*, not *changed*.
+//! default to `false` — which is what vanilla `bevy_gltf` does and what
+//! `VrmGltfPlugin`'s inner loader inherits. Switching the default would silently
+//! rotate every already-working avatar, so the orientation is *described*, not
+//! *changed*.
 //!
 //! `rotate_meshes` is reported as unsupported rather than honoured: it rebuilds
 //! mesh assets and their skinned bind poses, and rebaking inverse bind poses
@@ -45,7 +46,8 @@ pub enum VrmForwardPolicy {
     /// forward now matches Bevy's `Transform::forward`.
     AlreadyConverted,
     /// Keep the raw glTF orientation: the avatar faces +Z, matching vanilla
-    /// `bevy_gltf` with conversion disabled and this crate's legacy loader.
+    /// `bevy_gltf` with conversion disabled, which is what `VrmGltfPlugin`'s
+    /// loader inherits from `GltfPlugin`.
     #[default]
     KeepGltfForward,
     /// `rotate_meshes` was requested, which is not supported for `.vrm` /

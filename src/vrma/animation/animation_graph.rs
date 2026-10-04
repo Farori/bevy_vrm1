@@ -2,7 +2,6 @@ use crate::prelude::{
     ChildSearcher, RestGlobalTransform, RestTransform, RestWorldTransform, VrmBone,
 };
 use crate::vrm::Vrm;
-use crate::vrm::expressions::VrmExpressionRegistry;
 use crate::vrm::humanoid_bone::HumanoidBoneRegistry;
 use crate::vrma::animation::bake::{bake_rotation_curve, bake_translation_curve};
 use crate::vrma::animation::bone_rotation::{
@@ -43,7 +42,6 @@ impl Plugin for VrmaAnimationGraphPlugin {
     ) {
         app.add_observer(apply_animation_graph)
             .add_observer(apply_replace_humanoid_bone_animation_clips)
-            .add_observer(apply_regenerate_expression_clips)
             .add_systems(Update, apply_bake_clips);
     }
 }
@@ -125,11 +123,10 @@ fn generate_animation_graph(
 /// # Why these are the destination ids
 ///
 /// The ids registered are the ones `replace_bone_animation_clips` writes the
-/// curves onto — `AnimationTargetId::from_name` of the VRM bone name, put on the
-/// bone by `handler::scene::setup_animation` (pipeline scenes) or by
-/// `apply_initialize_humanoid_bones` (legacy scenes). Registering a source id
-/// instead would mask a rig that is never played, because the source curves are
-/// *moved* rather than copied.
+/// curves onto — `bone_target_id` of the VRM bone name, put on the bone by
+/// `handler::scene::setup_animation`. Registering a source id instead would
+/// mask a rig that is never played, because the source curves are *moved* rather
+/// than copied.
 ///
 /// # Why the query is world-wide
 ///
@@ -259,11 +256,12 @@ fn apply_replace_humanoid_bone_animation_clips(
 ///
 /// * the **destination** bone is found by its [`VrmBone`] component
 ///   (`find_by_bone_name`), which is what `handler::scene::setup_animation`
-///   writes for a load-time scene and what `apply_initialize_humanoid_bones`
-///   writes for a legacy one;
+///   writes onto a `.vrm`'s bones;
 /// * the **source** bone is found by the glTF node `Name` the registry was built
 ///   from, because `HumanoidBoneRegistry` maps `VrmBone -> Name` and a `.vrma`
-///   is still loaded by the legacy `VrmaLoaderPlugin` (`vrma/loader.rs:14`).
+///   carries node *references*, so its source rig is built at load time from the
+///   file's own `vrmc_vrm_animation.humanoid` (`VrmaLoaderPlugin`,
+///   `vrma/loader.rs:14`).
 ///
 /// Switching the source lookup to `VrmBone` as well would remove the last
 /// name-based step — glTF node names are optional and collide inside one file,
@@ -487,51 +485,6 @@ fn find_entity_by_name(
     children
         .iter()
         .find_map(|child| find_entity_by_name(world, child, name))
-}
-
-fn apply_regenerate_expression_clips(
-    trigger: On<RequestUpdateAnimationClips>,
-    mut clips: ResMut<Assets<AnimationClip>>,
-    clip_handles: Query<&VrmAnimationClipHandle>,
-    animation_targets: Query<&AnimationTargetId>,
-    expressions: Query<&VrmExpressionRegistry>,
-    searcher: ChildSearcher,
-    parents: Query<&ChildOf>,
-) {
-    let vrma_entity = trigger.event_target();
-    let Ok(vrm_entity) = parents.get(vrma_entity).map(|c| c.parent()) else {
-        return;
-    };
-    let Some(expressions_root) = searcher.find_expressions_root(vrm_entity) else {
-        return;
-    };
-    let Ok(vrm_animation_clip_handle) = clip_handles.get(vrma_entity) else {
-        return;
-    };
-    let Some(mut clip) = clips.get_mut(vrm_animation_clip_handle.0.id()) else {
-        return;
-    };
-    let Ok(registry) = expressions.get(vrm_entity) else {
-        return;
-    };
-    for (expression, _) in registry.iter() {
-        let Some(vrma_expression) = searcher.find_from_name(vrma_entity, expression) else {
-            continue;
-        };
-        let Some(expression_entity) = searcher.find_from_name(expressions_root, expression) else {
-            continue;
-        };
-        let Ok(vrma_target) = animation_targets.get(vrma_expression) else {
-            continue;
-        };
-        let Ok(target) = animation_targets.get(expression_entity) else {
-            continue;
-        };
-        let animation_curves = clip.curves_mut();
-        if let Some(curves) = animation_curves.remove(vrma_target) {
-            animation_curves.insert(*target, curves);
-        }
-    }
 }
 
 #[cfg(test)]

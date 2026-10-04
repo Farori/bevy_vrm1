@@ -81,16 +81,17 @@ pub(crate) fn finalize(
 /// The two markers every other system treats as "this scene is a fully
 /// initialized avatar".
 ///
-/// * [`Vrm`] is the crate's avatar-root marker. Legacy `spawn_vrm` inserts it
-///   (`src/vrm/initialize.rs:72`), and
-///   [`ParentSearcher::find_vrm`](crate::system_param::ParentSearcher::find_vrm),
+/// * [`Vrm`] is the crate's avatar-root marker, and the one this function writes
+///   it for. [`ParentSearcher::find_vrm`](crate::system_param::ParentSearcher::find_vrm),
 ///   [`VrmDetachPlugin`](crate::vrm::detach::VrmDetachPlugin) and body tracking
-///   (`src/vrm/body_tracking.rs:265`) all key on it, so a scene born from a
-///   `WorldAssetRoot` needs it too or it is invisible to all of them.
+///   (`src/vrm/body_tracking.rs:265`) all key on it, and a scene born from a
+///   `WorldAssetRoot` has no other way to get it.
 /// * [`Initialized`] is what the VRMA loader waits for on the parent before it
 ///   spawns a `VrmaHandle` child (`src/vrma/initialize.rs:38-44`), and what
 ///   `trigger_loaded` watches to request the animation graph
-///   (`src/vrma/initialize.rs:119`).
+///   (`src/vrma/initialize.rs:119`). It is also what
+///   [`spawn_vrm`](crate::prelude::spawn_vrm)'s observer looks for to find the
+///   VRM root of an instantiated scene.
 fn mark_initialized(
     world: &mut World,
     root: Entity,
@@ -537,10 +538,8 @@ fn build_look_at(
 /// (`src/vrma/animation/play.rs:141-149`), and
 /// [`VrmAnimation::all_finished`](crate::prelude::VrmAnimation::all_finished)
 /// reads the **root bone**'s player. So the root bone is the animation root and
-/// every target has to name it — which is exactly what legacy
-/// `apply_initialize_humanoid_bones` produces (`src/vrm/humanoid_bone.rs:158-167`,
-/// `:186`). A player left on the scene root would never be the player of any
-/// target, i.e. inert.
+/// every target has to name it. A player left on the scene root would never be
+/// the player of any target, i.e. inert.
 ///
 /// The scene root still carries the synthetic target
 /// [`vrm_root_animation_target`], so curves that address the avatar as a whole
@@ -551,9 +550,9 @@ fn setup_animation(
     world: &mut World,
     root: Entity,
 ) {
-    // The root bone is the parent of `hips`, exactly as the legacy path defines
-    // it (`src/vrm/humanoid_bone.rs:154-168`): `ChildSearcher::find_root_bone`
-    // and the VRMA retarget both look it up by `Vrm::ROOT_BONE`.
+    // The root bone is the parent of `hips`:
+    // `ChildSearcher::find_root_bone` and the VRMA retarget both look it up by
+    // `Vrm::ROOT_BONE`.
     let root_bone = state
         .bone_nodes
         .get("hips")
@@ -620,18 +619,17 @@ fn setup_animation(
 /// is scoped to the scene's own world, which `bone_nodes` — accumulated across
 /// every scene of the file — is not.
 ///
-/// # Open: the holder entity must survive instantiation
+/// # The holders follow the avatar
 ///
 /// The entity ids minted here belong to the loader's scratch world. The scene
 /// spawn pipeline remaps them through `Component::map_entities`, which
-/// `#[derive(Component)]` generates from `#[entities]` — and `entity_component!`
-/// (`src/macros.rs:89-111`) does not write that attribute on the holder's field,
-/// unlike [`VrmNodeConstraint::source`](crate::prelude::VrmNodeConstraint::source)
-/// (`src/vrm/components.rs:168-170`). An instantiated copy therefore still holds
-/// a scratch-world id, and gaze control sees a stale bone. See
-/// [`crate::vrm::humanoid_bone::insert_bone_holders`]; the
-/// missing piece is one `#[entities]` in `src/macros.rs`, which is outside this
-/// change's files.
+/// `#[derive(Component)]` generates from `#[entities]` — and
+/// `entity_component!` (`src/macros.rs:109-127`) does write that attribute on the
+/// holder's field, as it does on
+/// [`VrmNodeConstraint::source`](crate::prelude::VrmNodeConstraint::source)
+/// (`src/vrm/components.rs:168-170`). An instantiated avatar therefore holds its
+/// own bones, and gaze control sees a live entity rather than a stale id. See
+/// [`crate::vrm::humanoid_bone::insert_bone_holders`].
 fn insert_humanoid_bone_holders(
     world: &mut World,
     root: Entity,
@@ -651,10 +649,9 @@ fn insert_humanoid_bone_holders(
     }
 
     {
-        // `insert_bone_holders` writes through `Commands` because the legacy
-        // observer it is shared with is a system. The loader has none, so the
-        // world's own command queue takes that role — `bevy_ecs` documents these
-        // two calls for exactly this case.
+        // `insert_bone_holders` writes through `Commands`, which `bevy_gltf`'s
+        // loader does not have. The world's own command queue takes that role —
+        // `bevy_ecs` documents these two calls for exactly this case.
         let mut commands = world.commands();
         insert_bone_holders(root, &mut commands, &bones);
     }
@@ -669,11 +666,10 @@ fn insert_humanoid_bone_holders(
 /// derives the scene's context from the file's with
 /// `begin_labeled_asset` (`loader/mod.rs:1025`), which clones the path as it is
 /// and adds the `Scene0` label only when the asset is registered
-/// (`:1123-1126`). So this is the same string the legacy `VrmHandle` path stores
-/// from its handle (`src/vrm/initialize.rs:116`), and
+/// (`:1123-1126`). So this is the path the user passed to
+/// `AssetServer::load`, and
 /// [`RequestDetachVrm`](crate::vrm::detach::RequestDetachVrm) — which removes
-/// `VrmPath` again (`src/vrm/detach.rs:72`) — sees a pipeline scene exactly as
-/// it sees a legacy one.
+/// `VrmPath` again — has it to remove.
 fn insert_source_path(
     load_context: &LoadContext<'_>,
     world: &mut World,
@@ -1488,9 +1484,8 @@ mod tests {
             .is_some_and(|transform| transform.rotation.angle_between(Quat::IDENTITY) > 1e-3)
     }
 
-    /// The source path of the file *is* observable at load time, so a pipeline
-    /// scene carries `VrmPath` exactly like a legacy one and
-    /// `RequestDetachVrm` has something to remove.
+    /// The source path of the file *is* observable at load time, so a scene
+    /// carries `VrmPath` and `RequestDetachVrm` has something to remove.
     ///
     /// What is pinned here is the observable `insert_source_path` reads, because
     /// the function itself cannot be called from a test: `LoadContext::new` is
@@ -1513,8 +1508,7 @@ mod tests {
         assert_eq!(
             VrmPath::new(loaded.path()).0,
             VrmPath::new("vrm/Elmer.vrm").0,
-            "and the pipeline spells it exactly as the legacy `VrmHandle` path does \
-             (`src/vrm/initialize.rs:116`)"
+            "and it is exactly the path the caller passed to `AssetServer::load`"
         );
         // The same holds for the labeled handle a caller spawns the scene from.
         let labeled = bevy::asset::AssetPath::from("vrm/Elmer.vrm#Scene0");

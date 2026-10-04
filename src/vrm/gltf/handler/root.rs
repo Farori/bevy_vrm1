@@ -5,21 +5,20 @@
 //! sees bevy's [`Gltf`] asset and therefore cannot use
 //! [`VrmExtensions`](crate::vrm::gltf::extensions::VrmExtensions). The schemas
 //! themselves are the crate's shared ones
-//! ([`vrmc_vrm::VrmcVrm`], [`vrmc_spring_bone::VRMCSpringBone`]), so a file
-//! parses identically on both the legacy and the pipeline path, and there is no
-//! second set of VRM structs to keep in sync.
+//! ([`vrmc_vrm::VrmcVrm`], [`vrmc_spring_bone::VRMCSpringBone`]), the same ones a
+//! `.vrma` file's own extensions deserialize into, so there is no second set of
+//! VRM structs to keep in sync.
 //!
 //! # `VRMC_vrm_animation` is deliberately *not* a model root
 //!
 //! VRM 0.0 files put their model extensions under the name `VRMC_vrm_animation`,
-//! which the legacy loader's
-//! [`obtain_vrmc_vrm`](crate::vrm::gltf::extensions::obtain_vrmc_vrm) accepts as
-//! a fallback. This loader does not: `VRMC_vrm_animation-1.0` is the root of a
-//! `.vrma` file, whose `expressions` map holds *node references*
+//! which [`obtain_vrmc_vrm`](crate::vrm::gltf::extensions::obtain_vrmc_vrm)
+//! accepts as a fallback. This loader does not: `VRMC_vrm_animation-1.0` is the
+//! root of a `.vrma` file, whose `expressions` map holds *node references*
 //! (`{"happy": {"node": 5}}`) where `VRMC_vrm` holds expression *definitions*.
 //! Both deserialize into `VrmcVrm` — the reference parses as an empty
 //! expression — so accepting the name would silently turn every `.vrma` file
-//! loaded through the legacy [`VrmaLoaderPlugin`](crate::vrm::loader::VrmLoaderPlugin)
+//! loaded through [`VrmaLoaderPlugin`](crate::vrma::loader::VrmaLoaderPlugin)
 //! into a VRM scene with no expressions. Only `VRMC_vrm` marks a file as a VRM.
 
 use bevy::animation::AnimationTargetId;
@@ -229,8 +228,9 @@ fn collect_subtree(
 /// of such a file as `both`.
 ///
 /// A mesh instanced by several nodes with *different* skins has no single
-/// answer; it is recorded as unskinned, which is the same `both` fallback the
-/// legacy runtime reaches when a mesh has no usable joint indices.
+/// answer; it is recorded as unskinned, which is the same `both` fallback
+/// `handler::first_person::classify` reaches when a mesh has no usable joint
+/// indices.
 fn collect_mesh_skins(gltf: &gltf::Gltf) -> HashMap<usize, Option<usize>> {
     let mut skins: HashMap<usize, Option<usize>> = HashMap::default();
     for node in gltf.document.nodes() {
