@@ -1,4 +1,30 @@
-use crate::prelude::ChildSearcher;
+//! Facial expressions: the two shapes a model can carry, and the three
+//! user-facing triggers that write into either of them.
+//!
+//! # The two shapes
+//!
+//! The legacy loader builds one entity per expression below
+//! `VRMC_vrm.expressions`, records them in the root's
+//! [`ExpressionEntityMap`], and a trigger writes an [`ExpressionOverride`] onto
+//! them. [`bind_expressions`] then reads those overrides (falling back to the
+//! per-expression `Transform::translation.x` a `.vrma` retarget drives) and
+//! distributes them into `MorphWeights`.
+//!
+//! The load-time pipeline writes no entities: [`VrmExpressionWeights`],
+//! [`ExpressionSettings`] and the morph binds live on the VRM root itself, and
+//! `apply_expression_morph_binds` distributes the weights. A trigger therefore
+//! only has to write the weight — there is no per-expression entity to override.
+//!
+//! # Which shape a trigger writes
+//!
+//! [`SetExpressions`], [`ModifyExpressions`] and [`ClearExpressions`] detect the
+//! shape by component on their target entity, per trigger, and **the load-time
+//! shape wins whenever [`VrmExpressionWeights`] is present**: it is written
+//! directly, and the [`ExpressionEntityMap`] lookup is skipped entirely. Only an
+//! entity without that component falls back to the legacy path, so a model that
+//! somehow carries both is driven by the load-time shape only.
+
+use crate::prelude::{ChildSearcher, ExpressionSetting, ExpressionSettings, VrmExpressionWeights};
 use crate::system_set::VrmSystemSets;
 use crate::vrm::gltf::extensions::VrmExtensions;
 use crate::vrm::gltf::extensions::vrmc_vrm::MorphTargetBind;
@@ -122,6 +148,10 @@ pub struct ExpressionOverride(pub f32);
 ///
 /// For partial updates that preserve existing overrides, see [`ModifyExpressions`].
 ///
+/// Writes the load-time [`VrmExpressionWeights`] of the target root when it has
+/// one, and the legacy [`ExpressionOverride`]s otherwise; see the module docs
+/// for how the shape is detected.
+///
 /// **Note**: Triggering both `SetExpressions` and [`ModifyExpressions`]
 /// on the same entity in the same frame produces undefined results.
 ///
@@ -176,6 +206,10 @@ impl SetExpressions {
 /// This is the equivalent of `UniVRM`'s `SetWeight()` and three-vrm's `setValue()`.
 /// Ideal for lip-sync where mouth expressions are updated every frame
 /// while other expression overrides (e.g. emotions) remain active.
+///
+/// Writes the load-time [`VrmExpressionWeights`] of the target root when it has
+/// one, and the legacy [`ExpressionOverride`]s otherwise; see the module docs
+/// for how the shape is detected.
 ///
 /// **Note**: Triggering both [`SetExpressions`] and `ModifyExpressions`
 /// on the same entity in the same frame produces undefined results.
@@ -232,9 +266,10 @@ impl ModifyExpressions {
     /// expressions (aa, ih, ou, ee, oh) with the specified one active and
     /// the rest at 0.0. Non-mouth expression overrides are preserved.
     ///
-    /// Inserts `ExpressionOverride(0.0)` for inactive mouth expressions,
-    /// which overrides any VRMA animation value. Use [`ClearExpressions`]
-    /// to return all expressions to VRMA control.
+    /// Inserts a zero weight for inactive mouth expressions, which overrides
+    /// any VRMA animation value — `ExpressionOverride(0.0)` on the legacy shape,
+    /// a `0.0` entry in [`VrmExpressionWeights`] on the load-time one. Use
+    /// [`ClearExpressions`] to return all expressions to VRMA control.
     ///
     /// ```no_run
     /// use bevy::prelude::*;
@@ -299,6 +334,10 @@ impl ModifyExpressions {
 ///
 /// After triggering this event, expressions previously set by [`SetExpressions`]
 /// or [`ModifyExpressions`] will be controlled by VRMA animation again.
+///
+/// Empties the load-time [`VrmExpressionWeights`] of the target root when it has
+/// one, and removes the legacy [`ExpressionOverride`]s otherwise; see the module
+/// docs for how the shape is detected.
 #[derive(EntityEvent, Debug)]
 pub struct ClearExpressions {
     #[event_target]
@@ -566,16 +605,81 @@ fn bind_expressions(
     }
 }
 
+/// Clamps a raw weight exactly as the legacy path does before writing it.
+///
+/// Both shapes threshold `isBinary` at `0.5` and clamp every other weight to
+/// `0.0..=1.0`, so clamping here keeps a value a trigger wrote on the same side
+/// of the threshold and inside the `1.0 - clamp(rate)` suppressors as a value
+/// an animation curve wrote, and keeps [`SetExpressions`]' promise that weights
+/// arrive clamped.
+fn clamped_weight(weight: f32) -> f32 {
+    weight.clamp(0.0, 1.0)
+}
+
+/// Converts a trigger's weights into the load-time shape's key type, dropping
+/// the names the model does not declare.
+///
+/// `known` is the root's [`ExpressionSettings`] table when the loader wrote it.
+/// That table is the load-time counterpart of the legacy `ExpressionEntityMap`
+/// lookup: it holds one entry per expression the file declares, so a name the
+/// model does not declare is reported and skipped here exactly as the legacy
+/// path skips it, instead of being inserted into a map no bind can consume.
+/// `None` means there is no table to validate against — a root with weights but
+/// no settings is not a shape `apply_expression_morph_binds` can distribute at
+/// all (it requires all three components), so the names are taken as given, which
+/// is how that pass reads a weight without a setting: non-binary, unsuppressed.
+///
+/// The values are written **raw**: `isBinary` thresholding, the
+/// `overrideMouth`/`overrideBlink`/`overrideLookAt` suppressors and the
+/// bind-weight multiplication all happen later, in
+/// `apply_expression_morph_binds`. Applying them here instead would apply them
+/// twice for any expression an animation also drives.
+fn raw_expression_weights(
+    weights: &HashMap<VrmExpression, f32>,
+    known: Option<&HashMap<String, ExpressionSetting>>,
+    trigger: &str,
+) -> HashMap<String, f32> {
+    weights
+        .iter()
+        .filter_map(|(expression, weight)| {
+            let name = expression.as_str();
+            if let Some(known) = known
+                && !known.contains_key(name)
+            {
+                #[cfg(feature = "log")]
+                warn!("{trigger}: expression '{name}' not found");
+                return None;
+            }
+            Some((name.to_owned(), clamped_weight(*weight)))
+        })
+        .collect()
+}
+
 fn apply_set_expressions(
     trigger: On<SetExpressions>,
     cache: Query<&ExpressionEntityMap>,
+    mut load_time: Query<(&mut VrmExpressionWeights, Option<&ExpressionSettings>)>,
     mut commands: Commands,
 ) {
     let vrm_entity = trigger.event_target();
+    // Load-time shape: the weights *are* the override state, so replacing the
+    // map is the replace-all. A name the map no longer holds is a neutral face
+    // (`apply_expression_morph_binds` reads a missing weight as `0.0`), which is
+    // the same observable outcome as the legacy path's `ExpressionOverride`
+    // removal — the expression falls back to whatever drives it, here a `.vrma`
+    // expression curve, which re-inserts its own entry.
+    if let Ok((mut weights, settings)) = load_time.get_mut(vrm_entity) {
+        weights.0 = raw_expression_weights(
+            &trigger.weights,
+            settings.map(|settings| &settings.0),
+            "SetExpressions",
+        );
+        return;
+    }
     let Ok(map) = cache.get(vrm_entity) else {
         #[cfg(feature = "log")]
         warn!(
-            "SetExpressions: ExpressionEntityMap not found for entity {:?}. VRM may not be initialized yet.",
+            "SetExpressions: neither VrmExpressionWeights nor ExpressionEntityMap found for entity {:?}. The VRM may not be loaded yet.",
             vrm_entity
         );
         return;
@@ -595,20 +699,34 @@ fn apply_set_expressions(
         };
         commands
             .entity(expr_entity)
-            .insert(ExpressionOverride(weight.clamp(0.0, 1.0)));
+            .insert(ExpressionOverride(clamped_weight(*weight)));
     }
 }
 
 fn apply_modify_expressions(
     trigger: On<ModifyExpressions>,
     cache: Query<&ExpressionEntityMap>,
+    mut load_time: Query<(&mut VrmExpressionWeights, Option<&ExpressionSettings>)>,
     mut commands: Commands,
 ) {
     let vrm_entity = trigger.event_target();
+    // Load-time shape: merging the written weights over the current ones is the
+    // documented partial update, and the category rules (`mouth` zeroing the
+    // other vowels) are already baked into the event by
+    // `ModifyExpressions::mouth` / `mouth_weights`, so nothing here has to
+    // classify an expression.
+    if let Ok((mut weights, settings)) = load_time.get_mut(vrm_entity) {
+        weights.0.extend(raw_expression_weights(
+            &trigger.weights,
+            settings.map(|settings| &settings.0),
+            "ModifyExpressions",
+        ));
+        return;
+    }
     let Ok(map) = cache.get(vrm_entity) else {
         #[cfg(feature = "log")]
         warn!(
-            "ModifyExpressions: ExpressionEntityMap not found for entity {:?}. VRM may not be initialized yet.",
+            "ModifyExpressions: neither VrmExpressionWeights nor ExpressionEntityMap found for entity {:?}. The VRM may not be loaded yet.",
             vrm_entity
         );
         return;
@@ -621,16 +739,26 @@ fn apply_modify_expressions(
         };
         commands
             .entity(expr_entity)
-            .insert(ExpressionOverride(weight.clamp(0.0, 1.0)));
+            .insert(ExpressionOverride(clamped_weight(*weight)));
     }
 }
 
 fn apply_clear_expressions(
     trigger: On<ClearExpressions>,
     cache: Query<&ExpressionEntityMap>,
+    mut load_time: Query<&mut VrmExpressionWeights>,
     mut commands: Commands,
 ) {
     let vrm_entity = trigger.event_target();
+    // Load-time shape: emptying the map is the clear. The component itself stays
+    // — it is the shape marker the other two triggers detect, and
+    // `apply_expression_morph_binds` requires it, so removing it would both
+    // break the bind pass and make the next trigger fall back to the legacy
+    // path.
+    if let Ok(mut weights) = load_time.get_mut(vrm_entity) {
+        weights.0.clear();
+        return;
+    }
     let Ok(map) = cache.get(vrm_entity) else {
         return;
     };
@@ -659,6 +787,7 @@ fn obtain_expression_nodes(
 #[cfg(test)]
 mod tests {
     use crate::prelude::*;
+    use crate::success;
     use crate::tests::{TestResult, test_app};
     use crate::vrm::expressions::{
         BinaryExpression, BindExpressionNode, ClearExpressions, ExpressionCategory,
@@ -668,6 +797,7 @@ mod tests {
         VrmExpressionRegistry,
     };
     use bevy::ecs::system::RunSystemOnce;
+    use bevy::platform::collections::HashMap;
     use bevy::prelude::*;
 
     fn default_override_settings() -> ExpressionOverrideSettings {
@@ -692,6 +822,46 @@ mod tests {
             override_settings: default_override_settings(),
             is_binary: false,
         }
+    }
+
+    /// The per-expression settings of a model declaring `names`: the
+    /// load-time counterpart of the legacy `ExpressionEntityMap`, and the only
+    /// place a trigger can check that a name exists.
+    fn load_time_settings(names: &[&str]) -> ExpressionSettings {
+        ExpressionSettings(
+            names
+                .iter()
+                .map(|name| {
+                    (
+                        (*name).to_owned(),
+                        ExpressionSetting {
+                            is_binary: false,
+                            category: ExpressionCategory::from_preset_name(name),
+                            override_blink: ExpressionOverrideType::None,
+                            override_look_at: ExpressionOverrideType::None,
+                            override_mouth: ExpressionOverrideType::None,
+                        },
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// The weights of a model declaring `names`, seeded the way the loader's
+    /// `build_expressions` seeds them: one entry per expression, all at `0.0`.
+    fn load_time_weights(names: &[&str]) -> VrmExpressionWeights {
+        VrmExpressionWeights(names.iter().map(|name| ((*name).to_owned(), 0.0)).collect())
+    }
+
+    fn weights_of(
+        app: &App,
+        vrm_entity: Entity,
+    ) -> HashMap<String, f32> {
+        app.world()
+            .get::<VrmExpressionWeights>(vrm_entity)
+            .expect("the root carries the expression weights")
+            .0
+            .clone()
     }
 
     #[test]
@@ -1279,5 +1449,322 @@ mod tests {
             morph.weights()[1]
         );
         Ok(())
+    }
+
+    /// The load-time shape has no `ExpressionEntityMap` and no per-expression
+    /// entities, so `SetExpressions` has to work from the root's weights alone,
+    /// and it replaces every weight it did not name.
+    #[test]
+    fn test_set_expressions_writes_load_time_weights() -> TestResult {
+        let mut app = test_app();
+        app.add_plugins(VrmExpressionPlugin);
+
+        let vrm_entity = app
+            .world_mut()
+            .spawn((
+                load_time_weights(&["happy", "angry", "aa"]),
+                load_time_settings(&["happy", "angry", "aa"]),
+            ))
+            .id();
+
+        app.world_mut()
+            .commands()
+            .trigger(SetExpressions::single(vrm_entity, "happy", 0.8));
+        app.update();
+
+        assert!(
+            app.world().get::<ExpressionEntityMap>(vrm_entity).is_none(),
+            "the load-time shape has no entity map, and none may be required"
+        );
+        let weights = weights_of(&app, vrm_entity);
+        assert_eq!(weights.len(), 1, "SetExpressions replaces all weights");
+        assert_eq!(weights["happy"], 0.8);
+        success!()
+    }
+
+    /// A second `SetExpressions` drops the weight the first one wrote, which is
+    /// the load-time spelling of the legacy `ExpressionOverride` removal.
+    #[test]
+    fn test_set_expressions_replaces_previous_load_time_weights() -> TestResult {
+        let mut app = test_app();
+        app.add_plugins(VrmExpressionPlugin);
+
+        let vrm_entity = app
+            .world_mut()
+            .spawn((
+                load_time_weights(&["happy", "angry"]),
+                load_time_settings(&["happy", "angry"]),
+            ))
+            .id();
+
+        app.world_mut()
+            .commands()
+            .trigger(SetExpressions::single(vrm_entity, "happy", 1.0));
+        app.update();
+        assert_eq!(weights_of(&app, vrm_entity)["happy"], 1.0);
+
+        app.world_mut()
+            .commands()
+            .trigger(SetExpressions::single(vrm_entity, "angry", 0.7));
+        app.update();
+
+        let weights = weights_of(&app, vrm_entity);
+        assert!(
+            !weights.contains_key("happy"),
+            "the previous weight is dropped, leaving the expression to animation"
+        );
+        assert_eq!(weights["angry"], 0.7);
+        success!()
+    }
+
+    /// Weights are clamped on write, as documented on [`SetExpressions`], and a
+    /// name the model does not declare is skipped instead of being inserted.
+    #[test]
+    fn test_set_expressions_clamps_and_skips_unknown_load_time_weights() -> TestResult {
+        let mut app = test_app();
+        app.add_plugins(VrmExpressionPlugin);
+
+        let vrm_entity = app
+            .world_mut()
+            .spawn((
+                load_time_weights(&["happy"]),
+                load_time_settings(&["happy"]),
+            ))
+            .id();
+
+        app.world_mut()
+            .commands()
+            .trigger(SetExpressions::from_iter(
+                vrm_entity,
+                [("happy", 4.0), ("nope", 1.0)],
+            ));
+        app.update();
+
+        let weights = weights_of(&app, vrm_entity);
+        assert_eq!(weights["happy"], 1.0, "the weight is clamped to 1.0");
+        assert!(
+            !weights.contains_key("nope"),
+            "an expression the model does not declare is not written"
+        );
+        success!()
+    }
+
+    /// `ModifyExpressions` is the partial update: it merges over the current
+    /// weights instead of replacing them.
+    #[test]
+    fn test_modify_expressions_merges_load_time_weights() -> TestResult {
+        let mut app = test_app();
+        app.add_plugins(VrmExpressionPlugin);
+
+        let vrm_entity = app
+            .world_mut()
+            .spawn((
+                load_time_weights(&["happy", "angry"]),
+                load_time_settings(&["happy", "angry"]),
+            ))
+            .id();
+
+        app.world_mut()
+            .commands()
+            .trigger(SetExpressions::single(vrm_entity, "happy", 1.0));
+        app.update();
+
+        app.world_mut()
+            .commands()
+            .trigger(ModifyExpressions::single(vrm_entity, "angry", 0.7));
+        app.update();
+
+        let weights = weights_of(&app, vrm_entity);
+        assert_eq!(weights["happy"], 1.0, "the existing weight is preserved");
+        assert_eq!(weights["angry"], 0.7, "the named weight is merged in");
+        success!()
+    }
+
+    /// `ModifyExpressions::mouth` zeroes the four other vowels on write, which
+    /// is what makes lip-sync work, and leaves the non-mouth weights alone.
+    #[test]
+    fn test_modify_expressions_mouth_resets_the_other_vowels_on_load_time_weights() -> TestResult {
+        let mut app = test_app();
+        app.add_plugins(VrmExpressionPlugin);
+
+        const NAMES: [&str; 6] = ["happy", "aa", "ih", "ou", "ee", "oh"];
+        let vrm_entity = app
+            .world_mut()
+            .spawn((load_time_weights(&NAMES), load_time_settings(&NAMES)))
+            .id();
+
+        app.world_mut()
+            .commands()
+            .trigger(SetExpressions::single(vrm_entity, "happy", 0.6));
+        app.update();
+
+        app.world_mut()
+            .commands()
+            .trigger(ModifyExpressions::mouth(vrm_entity, "aa", 0.8));
+        app.update();
+
+        let weights = weights_of(&app, vrm_entity);
+        assert_eq!(weights["aa"], 0.8, "the active vowel");
+        for vowel in ["ih", "ou", "ee", "oh"] {
+            assert_eq!(
+                weights[vowel], 0.0,
+                "`ModifyExpressions::mouth` resets {vowel}"
+            );
+        }
+        assert_eq!(weights["happy"], 0.6, "a non-mouth weight is preserved");
+        success!()
+    }
+
+    /// `ClearExpressions` empties the weights but keeps the component, which is
+    /// the shape marker the other triggers detect and `apply_expression_morph_binds`
+    /// requires.
+    #[test]
+    fn test_clear_expressions_clears_load_time_weights() -> TestResult {
+        let mut app = test_app();
+        app.add_plugins(VrmExpressionPlugin);
+
+        let vrm_entity = app
+            .world_mut()
+            .spawn((
+                load_time_weights(&["happy", "angry"]),
+                load_time_settings(&["happy", "angry"]),
+            ))
+            .id();
+
+        app.world_mut()
+            .commands()
+            .trigger(SetExpressions::from_iter(
+                vrm_entity,
+                [("happy", 0.8), ("angry", 0.5)],
+            ));
+        app.update();
+        assert_eq!(weights_of(&app, vrm_entity).len(), 2);
+
+        app.world_mut()
+            .commands()
+            .trigger(ClearExpressions { entity: vrm_entity });
+        app.update();
+
+        assert!(
+            weights_of(&app, vrm_entity).is_empty(),
+            "every weight is cleared"
+        );
+        assert!(
+            app.world()
+                .get::<VrmExpressionWeights>(vrm_entity)
+                .is_some(),
+            "the component stays: it is the shape marker and the bind pass needs it"
+        );
+        success!()
+    }
+
+    /// Should a root ever carry both shapes, the load-time one is the one that
+    /// is written and the legacy expression entities are left untouched.
+    #[test]
+    fn test_load_time_weights_take_precedence_over_the_entity_map() -> TestResult {
+        let mut app = test_app();
+        app.add_plugins(VrmExpressionPlugin);
+
+        let vrm_entity = app
+            .world_mut()
+            .spawn((VrmExpressionRegistry(
+                [(VrmExpression::from("happy"), simple_metadata("MeshA", 0))]
+                    .into_iter()
+                    .collect(),
+            ),))
+            .with_children(|c| {
+                c.spawn(Name::new("MeshA"));
+            })
+            .id();
+
+        app.world_mut()
+            .commands()
+            .entity(vrm_entity)
+            .trigger(RequestInitializeExpressions);
+        app.update();
+
+        // Now give the root the load-time shape as well.
+        app.world_mut()
+            .entity_mut(vrm_entity)
+            .insert(load_time_weights(&["happy"]));
+
+        app.world_mut()
+            .commands()
+            .trigger(SetExpressions::single(vrm_entity, "happy", 0.9));
+        app.update();
+
+        let map = app
+            .world()
+            .get::<ExpressionEntityMap>(vrm_entity)
+            .expect("the legacy path is still built");
+        let happy_entity = *map.0.get(&VrmExpression::from("happy")).unwrap();
+        assert_eq!(weights_of(&app, vrm_entity)["happy"], 0.9);
+        assert!(
+            app.world()
+                .get::<ExpressionOverride>(happy_entity)
+                .is_none(),
+            "the legacy overrides are skipped when the load-time shape is present"
+        );
+        success!()
+    }
+
+    /// A trigger writes a *raw* weight: `isBinary` is thresholded by
+    /// `apply_expression_morph_binds`, not by the trigger.
+    #[test]
+    fn test_triggered_load_time_weights_are_distributed_by_the_bind_pass() -> TestResult {
+        let mut app = test_app();
+        app.add_plugins(VrmExpressionPlugin);
+
+        let mesh_entity = app
+            .world_mut()
+            .spawn(MorphWeights::new(vec![0.0], None)?)
+            .id();
+        let vrm_entity = app
+            .world_mut()
+            .spawn((
+                load_time_weights(&["blink"]),
+                ExpressionMorphBinds(MorphBindTable(HashMap::from([(
+                    "blink".to_owned(),
+                    vec![MorphBind {
+                        target: mesh_entity,
+                        index: 0,
+                        weight: 1.0,
+                    }],
+                )]))),
+                ExpressionSettings(HashMap::from([(
+                    "blink".to_owned(),
+                    ExpressionSetting {
+                        is_binary: true,
+                        category: ExpressionCategory::Blink,
+                        override_blink: ExpressionOverrideType::None,
+                        override_look_at: ExpressionOverrideType::None,
+                        override_mouth: ExpressionOverrideType::None,
+                    },
+                )])),
+            ))
+            .id();
+
+        app.world_mut()
+            .commands()
+            .trigger(SetExpressions::single(vrm_entity, "blink", 0.3));
+        app.update();
+
+        assert_eq!(
+            weights_of(&app, vrm_entity)["blink"],
+            0.3,
+            "the trigger stores the weight verbatim"
+        );
+
+        app.world_mut()
+            .run_system_once(apply_expression_morph_binds)
+            .expect("the bind pass runs");
+
+        let morph = app.world().get::<MorphWeights>(mesh_entity).unwrap();
+        assert_eq!(
+            morph.weights()[0],
+            0.0,
+            "`isBinary` thresholds 0.3 to 0.0, in the bind pass"
+        );
+        success!()
     }
 }
