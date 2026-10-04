@@ -21,6 +21,49 @@ This crate allows you to use [VRM1.0](https://vrm.dev/en/vrm/vrm_about/) and [VR
 | Node Constraint | ✅                  |
 | First Person    | ✅                  |
 
+### Loading
+
+A `.vrm` loads through the stock Bevy glTF loader. `VrmGltfPlugin` claims the `vrm` file extension and writes every VRM component into the scene asset **while the file loads**, so an instantiated avatar is already initialized and there is nothing left to do at runtime. `VrmGltfPlugin` has to be added after `DefaultPlugins`, because it registers its handler in a resource `GltfPlugin` prepares:
+
+```rust
+use bevy::prelude::*;
+use bevy_vrm1::prelude::*;
+
+fn main() {
+    App::new()
+        .add_plugins((DefaultPlugins, VrmPlugin, VrmGltfPlugin))
+        .run();
+}
+```
+
+`VrmPlugin` is the runtime half — spring bones, gaze control, expressions, node constraints and `MToon` rendering — and `VrmaPlugin` is added on top only when you want `.vrma` playback.
+
+`spawn_vrm` is the supported way to put an avatar into a scene. The scene is instantiated asynchronously, so the entity that carries the avatar's components is *not* the entity the spawn creates; `spawn_vrm` resolves it and hands it to your closure:
+
+```rust
+fn spawn_avatar(mut commands: Commands) {
+    spawn_vrm(&mut commands, "vrm/Elmer.vrm", |root| {
+        root.insert(LookAt::Cursor);
+    });
+}
+```
+
+If you would rather own the entity yourself, spawn the scene as a `WorldAssetRoot` — it is the same thing `spawn_vrm` does:
+
+```rust
+fn spawn_avatar(mut commands: Commands, asset_server: Res<AssetServer>) {
+    commands.spawn(WorldAssetRoot(
+        asset_server.load(GltfAssetLabel::Scene(0).from_asset("vrm/Elmer.vrm")),
+    ));
+}
+```
+
+Either way the VRM root is a **child** of the entity you spawned, and it is the entity carrying `Vrm` and `Initialized`.
+
+#### examples
+
+- [simple.rs](./examples/simple.rs)
+
 ### Spring Bone
 
 ![SpringBone](./docs/spring_bone.gif)
@@ -95,10 +138,9 @@ All constraint types use spherical linear interpolation (slerp) based on the wei
 
 This is a feature for hiding the avatar's head from a camera placed at its viewpoint, so that it does not block the view.
 
-To use it, attach `FirstPersonCamera` or `ThirdPersonCamera` to your cameras and trigger `RequestEnableFirstPerson` on the VRM entity.
-The meshes are then assigned `RenderLayers` according to the model's `meshAnnotations`, and meshes without an annotation are split by head bone weights.
+The decision is made while the `.vrm` loads, so nothing has to be triggered at runtime: a mesh the model annotates as visible in both views is put on `LAYER_BOTH`, a `firstPersonOnly` mesh on `LAYER_FIRST_PERSON_ONLY`, and a mesh with no annotation is classified `auto` by its head-bone vertex weights — the head part is split off into a `VrmHeadOnly` copy on `LAYER_THIRD_PERSON_ONLY` and the rest stays on `LAYER_BOTH`.
 
-`RequestDisableFirstPerson` makes all meshes visible from every camera again, and the layers used for the separation can be changed through the `FirstPersonLayers` resource.
+Choosing a view is then only a question of the layers the camera carries: give it `third_person_camera_layers()` or `first_person_camera_layers()`, or combine `both_view_mesh_layers()` with your own layers. `VrmLightLayersPlugin` is opt-in and widens every light that carries no explicit layers, so the split-off head still reaches the shadow map.
 
 #### examples
 
