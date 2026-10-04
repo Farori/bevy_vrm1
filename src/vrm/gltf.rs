@@ -78,10 +78,11 @@ use crate::prelude::{
     ColliderShape, ConstraintExecutionOrder, ExpressionMorphBinds, ExpressionSettings, Initialized,
     LookAtProperties, LookAtType, MorphBind, PendingNodeConstraint, RestGlobalTransform,
     RestTransform, RestWorldTransform, Vrm, VrmBone, VrmConstraintKind, VrmExpressionWeights,
-    VrmHeadOnly, VrmNodeConstraint, VrmNodeIndex, apply_expression_morph_binds,
+    VrmHeadOnly, VrmNodeConstraint, VrmNodeIndex, VrmPath, apply_expression_morph_binds,
 };
 use crate::system_set::VrmSystemSets;
 use crate::vrm::gltf::handler::VrmExtensionHandler;
+use crate::vrm::humanoid_bone::register_bone_components;
 
 /// Registers the VRM extension handler and the `.vrm` asset loader.
 ///
@@ -182,6 +183,10 @@ impl Plugin for VrmGltfPlugin {
             .register_type::<VrmNodeConstraint>()
             .register_type::<VrmConstraintKind>()
             .register_type::<ConstraintExecutionOrder>()
+            // The source asset path of a pipeline scene. `VrmPlugin` registers it
+            // too; double registration is a no-op, and a scene that is loaded
+            // without `VrmPlugin` in the app must still carry it.
+            .register_type::<VrmPath>()
             // Written on the root bone and every humanoid bone so the VRMA
             // retarget can recognise a model as a pose source. `VrmaPlugin`
             // registers it too; double registration is a no-op.
@@ -203,6 +208,12 @@ impl Plugin for VrmGltfPlugin {
             .register_type::<ExpressionMorphBinds>()
             .register_type::<ExpressionSettings>()
             .register_type::<MorphBind>();
+
+        // The bone markers written on the bone entities and the
+        // `<Bone>BoneEntity` holders written on the scene root
+        // (`handler::scene::insert_humanoid_bone_holders`). Same reason: an
+        // unregistered component is dropped when the scene is instantiated.
+        register_bone_components(app);
 
         // `GltfConvertCoordinates` is a public type with public bool fields, so
         // only the two flags this crate cares about are read.

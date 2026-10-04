@@ -90,6 +90,132 @@ macro_rules! insert_bone {
     };
 }
 
+/// Inserts every bone-entity holder of an avatar onto its root, plus each bone's
+/// own marker on the bone itself.
+///
+/// * the root gets one `<Bone>BoneEntity(Entity)` holder per bone
+///   ([`HeadBoneEntity`], [`NeckBoneEntity`], …), which is how a system
+///   addresses a bone *through* the avatar rather than through the hierarchy:
+///   [`track_looking_target`](crate::vrm::look_at::track_looking_target),
+///   [`track_body_tracking`](crate::vrm::body_tracking) and the first-person
+///   auto split all read them;
+/// * the bone entity gets its marker ([`Head`], [`LeftEye`], …), which is what a
+///   reader uses to recognise a bone without resolving the holder.
+///
+/// One definition, two callers: the legacy observer
+/// [`apply_initialize_humanoid_bones`], which patches a hierarchy that was
+/// spawned over several frames, and the load-time pipeline
+/// ([`scene::finalize`](crate::vrm::gltf::handler::scene)), which writes into
+/// the scene [`bevy::world_serialization::WorldAsset`] so a
+/// `SceneRoot` is born holding them. A `bones` entry whose name is not one of the
+/// 55 Unity humanoid bone names inserts nothing — the macro has always fallen
+/// through on those.
+///
+/// # Why `Commands`, and not `&mut World`
+///
+/// The legacy caller is a system, and the writes are plain component inserts, so
+/// one definition has to serve it. `bevy_gltf`'s loader has no `Commands` to
+/// hand out, so the pipeline borrows the world's own command queue
+/// (`World::commands`) and flushes it (`World::flush`) before the world is
+/// frozen into a `WorldAsset` — the same two calls `bevy_ecs` documents for
+/// exactly this case.
+///
+/// # Open: the holders must remap their entity on instantiation
+///
+/// Writing them into a scene asset is only half the job. The scene spawn
+/// pipeline remaps entity references through `Component::map_entities`
+/// (`bevy_ecs/src/reflect/component.rs:340`, `:345`, `:353`), which
+/// `#[derive(Component)]` generates from `#[entities]` field attributes — and
+/// `entity_component!` (`src/macros.rs:89-111`) does not write one, unlike
+/// [`VrmNodeConstraint::source`](crate::prelude::VrmNodeConstraint::source)
+/// (`src/vrm/components.rs:168-170`). So a holder instantiated from the scene
+/// still names the entity id of the loader's scratch world. Until
+/// `entity_component!` marks the field `#[entities]`, gaze control on an
+/// instantiated pipeline avatar sees a stale id: inert if nothing occupies it,
+/// a wrong bone if something does. Everything else about this function is
+/// final; that one attribute is not.
+pub(crate) fn insert_bone_holders(
+    root: Entity,
+    commands: &mut Commands,
+    bones: &[(VrmBone, Entity)],
+) {
+    for (bone, bone_entity) in bones {
+        let bone_entity = *bone_entity;
+        insert_bone!(
+            commands,
+            root,
+            bone_entity,
+            bone,
+            Hips,
+            RightRingProximal,
+            RightThumbDistal,
+            RightRingIntermediate,
+            RightUpperArm,
+            LeftIndexProximal,
+            LeftUpperLeg,
+            LeftFoot,
+            LeftIndexDistal,
+            LeftThumbMetacarpal,
+            RightLowerArm,
+            LeftMiddleDistal,
+            RightUpperLeg,
+            LeftToes,
+            LeftThumbDistal,
+            RightShoulder,
+            RightThumbMetacarpal,
+            Spine,
+            LeftLowerLeg,
+            LeftShoulder,
+            LeftUpperArm,
+            UpperChest,
+            RightToes,
+            RightIndexDistal,
+            LeftMiddleProximal,
+            LeftRingProximal,
+            LeftRingDistal,
+            LeftThumbMetacarpal,
+            LeftIndexIntermediate,
+            LeftLittleProximal,
+            LeftLittleDistal,
+            RightHand,
+            RightLittleProximal,
+            LeftRingIntermediate,
+            RightIndexIntermediate,
+            Chest,
+            LeftHand,
+            RightLittleIntermediate,
+            RightFoot,
+            RightLowerLeg,
+            LeftLittleIntermediate,
+            LeftLowerArm,
+            RightLittleDistal,
+            RightMiddleIntermediate,
+            RightMiddleProximal,
+            RightThumbMetacarpal,
+            Neck,
+            Jaw,
+            Head,
+            LeftEye,
+            RightEye,
+            LeftMiddleIntermediate,
+            RightRingDistal,
+            RightIndexProximal,
+            RightMiddleDistal,
+        );
+    }
+}
+
+/// Registers the bone markers and the bone-entity holders.
+///
+/// [`crate::vrm::gltf::VrmGltfPlugin`] calls this because the
+/// pipeline writes both families into the scene asset, and the scene spawn
+/// pipeline drops any component whose type is not registered
+/// (`ReflectComponent::apply_or_insert_mapped`). `VrmPlugin` would register them
+/// too, and adding [`BonesPlugin`] twice is a no-op.
+pub(crate) fn register_bone_components(app: &mut App) {
+    app.add_plugins(BonesPlugin);
+}
+
 fn apply_insert_rest_transforms(
     trigger: On<RequestInitializeHumanoidBones>,
     mut commands: Commands,
@@ -167,6 +293,11 @@ fn apply_initialize_humanoid_bones(
         ));
     }
 
+    // Collected first, written afterwards by [`insert_bone_holders`] — the same
+    // helper the load-time pipeline calls, so the two paths cannot drift apart.
+    // Order is irrelevant: every entry is one plain component insert on an
+    // already-resolved entity, and the commands are buffered anyway.
+    let mut bones = Vec::with_capacity(registry.iter().len());
     for (bone, name) in registry.iter() {
         let Some(bone_entity) = searcher.find_from_name(model_entity, name.as_str()) else {
             continue;
@@ -185,68 +316,9 @@ fn apply_initialize_humanoid_bones(
                 .entity(bone_entity)
                 .insert((AnimationTargetId::from_name(name), AnimatedBy(*root_bone)));
         }
-        insert_bone!(
-            commands,
-            model_entity,
-            bone_entity,
-            bone,
-            Hips,
-            RightRingProximal,
-            RightThumbDistal,
-            RightRingIntermediate,
-            RightUpperArm,
-            LeftIndexProximal,
-            LeftUpperLeg,
-            LeftFoot,
-            LeftIndexDistal,
-            LeftThumbMetacarpal,
-            RightLowerArm,
-            LeftMiddleDistal,
-            RightUpperLeg,
-            LeftToes,
-            LeftThumbDistal,
-            RightShoulder,
-            RightThumbMetacarpal,
-            Spine,
-            LeftLowerLeg,
-            LeftShoulder,
-            LeftUpperArm,
-            UpperChest,
-            RightToes,
-            RightIndexDistal,
-            LeftMiddleProximal,
-            LeftRingProximal,
-            LeftRingDistal,
-            LeftThumbProximal,
-            LeftIndexIntermediate,
-            LeftLittleProximal,
-            LeftLittleDistal,
-            RightHand,
-            RightLittleProximal,
-            LeftRingIntermediate,
-            RightIndexIntermediate,
-            Chest,
-            LeftHand,
-            RightLittleIntermediate,
-            RightFoot,
-            RightLowerLeg,
-            LeftLittleIntermediate,
-            LeftLowerArm,
-            RightLittleDistal,
-            RightMiddleIntermediate,
-            RightMiddleProximal,
-            RightThumbProximal,
-            Neck,
-            Jaw,
-            Head,
-            LeftEye,
-            RightEye,
-            LeftMiddleIntermediate,
-            RightRingDistal,
-            RightIndexProximal,
-            RightMiddleDistal,
-        );
+        bones.push((bone.clone(), bone_entity));
     }
+    insert_bone_holders(model_entity, &mut commands, &bones);
 }
 
 #[cfg(test)]

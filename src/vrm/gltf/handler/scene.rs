@@ -16,8 +16,10 @@
 //! 4. node constraints: node indices resolved to entities and sorted;
 //! 5. expressions and look-at on the scene root;
 //! 6. animation targets and the player;
-//! 7. firstPerson render layers and the head copies;
-//! 8. the `Initialized` marker, which is what the rest of the crate treats as
+//! 7. the bone markers and the `<Bone>BoneEntity` holders on the scene root,
+//!    without which gaze control and body tracking match nothing;
+//! 8. the source asset path, then firstPerson render layers and the head copies;
+//! 9. the `Initialized` marker, which is what the rest of the crate treats as
 //!    "this scene is a fully initialized VRM".
 
 use bevy::animation::{AnimatedBy, AnimationPlayer};
@@ -39,13 +41,14 @@ use crate::error::vrm_warn;
 use crate::prelude::{
     ConstraintExecutionOrder, ExpressionMorphBinds, ExpressionSetting, ExpressionSettings,
     Initialized, MToonMaterial, MorphBind, PendingNodeConstraint, RestGlobalTransform,
-    RestTransform, RestWorldTransform, Vrm, VrmExpressionWeights, VrmHeadOnly, VrmNodeConstraint,
-    both_view_mesh_layers, first_person_only_mesh_layers, third_person_only_mesh_layers,
-    vrm_root_animation_target,
+    RestTransform, RestWorldTransform, Vrm, VrmBone, VrmExpressionWeights, VrmHeadOnly,
+    VrmNodeConstraint, VrmPath, both_view_mesh_layers, first_person_only_mesh_layers,
+    third_person_only_mesh_layers, vrm_root_animation_target,
 };
 use crate::vrm::expressions::{ExpressionCategory, ExpressionOverrideType};
 use crate::vrm::gltf::extensions::vrmc_spring_bone::ColliderShape;
 use crate::vrm::gltf::extensions::vrmc_vrm::FirstPersonFlag;
+use crate::vrm::humanoid_bone::insert_bone_holders;
 use crate::vrm::spring_bone::{
     SpringCenterNode, SpringColliders, SpringJointProps, SpringJointState, SpringJoints, SpringRoot,
 };
@@ -68,6 +71,8 @@ pub(crate) fn finalize(
     build_expressions(state, scene_world, world_root_id);
     build_look_at(state, scene_world, world_root_id);
     setup_animation(state, scene_world, world_root_id);
+    insert_humanoid_bone_holders(scene_world, world_root_id);
+    insert_source_path(load_context, scene_world, world_root_id);
     apply_first_person(state, load_context, scene_world);
 
     mark_initialized(scene_world, world_root_id);
@@ -588,6 +593,97 @@ fn setup_animation(
     }
 }
 
+/// Puts the `<Bone>BoneEntity` holders and the bone markers on the scene.
+///
+/// The holders are what the runtime systems that address a bone *through* the
+/// avatar read, and a scene that has none is inert:
+///
+/// * [`track_looking_target`](crate::vrm::look_at::track_looking_target) needs
+///   [`HeadBoneEntity`](crate::prelude::HeadBoneEntity) plus both eye holders,
+///   so `LookAt` does nothing without them
+///   (`src/vrm/look_at.rs:66-72`);
+/// * [`track_body_tracking`](crate::vrm::body_tracking) needs
+///   [`HeadBoneEntity`](crate::prelude::HeadBoneEntity) and optionally the
+///   neck / chest / spine holders (`src/vrm/body_tracking.rs:258-261`);
+/// * the first-person auto split walks up to `<Vrm, HeadBoneEntity>` to find the
+///   head subtree (`src/vrm/first_person.rs:256`, `:358-370`).
+///
+/// Everything else they need is already here — [`Vrm`] and [`Initialized`] on
+/// the root, and the rest poses from [`insert_rest_transforms`] on the bones.
+///
+/// # Why the mapping is read off `VrmBone`, not off `bone_nodes`
+///
+/// [`VrmNodeIndex`](crate::prelude::VrmNodeIndex) and [`VrmBone`] are written per
+/// node in [`nodes::process_node`](super::nodes::process_node), which also
+/// resolves a node claimed by two humanoid bones to a single name. The world is
+/// therefore the authority on *which entity is which bone*, and the query below
+/// is scoped to the scene's own world, which `bone_nodes` — accumulated across
+/// every scene of the file — is not.
+///
+/// # Open: the holder entity must survive instantiation
+///
+/// The entity ids minted here belong to the loader's scratch world. The scene
+/// spawn pipeline remaps them through `Component::map_entities`, which
+/// `#[derive(Component)]` generates from `#[entities]` — and `entity_component!`
+/// (`src/macros.rs:89-111`) does not write that attribute on the holder's field,
+/// unlike [`VrmNodeConstraint::source`](crate::prelude::VrmNodeConstraint::source)
+/// (`src/vrm/components.rs:168-170`). An instantiated copy therefore still holds
+/// a scratch-world id, and gaze control sees a stale bone. See
+/// [`crate::vrm::humanoid_bone::insert_bone_holders`]; the
+/// missing piece is one `#[entities]` in `src/macros.rs`, which is outside this
+/// change's files.
+fn insert_humanoid_bone_holders(
+    world: &mut World,
+    root: Entity,
+) {
+    let mut bones: Vec<(VrmBone, Entity)> = {
+        let mut query = world.query::<(Entity, &VrmBone)>();
+        query
+            .iter(world)
+            .map(|(entity, bone)| (bone.clone(), entity))
+            .collect()
+    };
+    // Query iteration order is undefined; the inserts do not depend on it, but
+    // sorting keeps the result reproducible for a log or an assertion.
+    bones.sort_by_key(|(_, entity)| *entity);
+    if bones.is_empty() {
+        return;
+    }
+
+    {
+        // `insert_bone_holders` writes through `Commands` because the legacy
+        // observer it is shared with is a system. The loader has none, so the
+        // world's own command queue takes that role — `bevy_ecs` documents these
+        // two calls for exactly this case.
+        let mut commands = world.commands();
+        insert_bone_holders(root, &mut commands, &bones);
+    }
+    // Applied before `WorldAsset::new` freezes the world, so the holders are part
+    // of the asset the scene spawn pipeline copies out of.
+    world.flush();
+}
+
+/// Records the file the scene was loaded from as [`VrmPath`].
+///
+/// [`LoadContext::path`] is observable here, and it is the *file*: `bevy_gltf`
+/// derives the scene's context from the file's with
+/// `begin_labeled_asset` (`loader/mod.rs:1025`), which clones the path as it is
+/// and adds the `Scene0` label only when the asset is registered
+/// (`:1123-1126`). So this is the same string the legacy `VrmHandle` path stores
+/// from its handle (`src/vrm/initialize.rs:116`), and
+/// [`RequestDetachVrm`](crate::vrm::detach::RequestDetachVrm) — which removes
+/// `VrmPath` again (`src/vrm/detach.rs:72`) — sees a pipeline scene exactly as
+/// it sees a legacy one.
+fn insert_source_path(
+    load_context: &LoadContext<'_>,
+    world: &mut World,
+    root: Entity,
+) {
+    world
+        .entity_mut(root)
+        .insert(VrmPath::new(load_context.path().path()));
+}
+
 /// Applies the `VRMC_vrm.firstPerson` decisions to the scene.
 ///
 /// Three passes, in this order:
@@ -761,10 +857,16 @@ fn insert_layers_recursive(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::prelude::VrmConstraintKind;
+    use crate::prelude::{
+        BodyTracking, ChestBoneEntity, Head, HeadBoneEntity, Hips, HipsBoneEntity, LeftEye,
+        LeftEyeBoneEntity, LookAt, NeckBoneEntity, RightEyeBoneEntity, SpineBoneEntity,
+        VrmConstraintKind,
+    };
     use crate::success;
-    use crate::tests::TestResult;
+    use crate::tests::{TestResult, test_app};
+    use crate::vrm::body_tracking::BodyTrackingPlugin;
     use crate::vrm::gltf::extensions::vrmc_vrm::VrmcVrm;
+    use crate::vrm::look_at::LookAtPlugin;
     use bevy::animation::AnimationTargetId;
 
     /// `VrmcVrm` parsed from a JSON literal, so the tests below exercise the
@@ -1130,6 +1232,293 @@ mod tests {
             Some(&third_person_only_mesh_layers()),
             "the primitive classification survives an `auto` annotation"
         );
+        success!()
+    }
+
+    /// The humanoid bones of the fixture below, in the order its glTF node
+    /// indices are numbered. The chain mirrors a real rig:
+    /// `root -> root bone -> hips -> spine -> chest -> neck -> head`, with both
+    /// eyes under the head — the four bones
+    /// [`track_body_tracking`](crate::vrm::body_tracking) walks, plus the two
+    /// eye bones [`track_looking_target`](crate::vrm::look_at::track_looking_target)
+    /// needs.
+    const GAZE_BONES: [&str; 7] = [
+        "hips", "spine", "chest", "neck", "head", "leftEye", "rightEye",
+    ];
+
+    /// The entities of a pipeline scene's gaze rig.
+    struct GazeScene {
+        root: Entity,
+        hips: Entity,
+        spine: Entity,
+        chest: Entity,
+        neck: Entity,
+        head: Entity,
+        left_eye: Entity,
+        right_eye: Entity,
+    }
+
+    impl GazeScene {
+        /// The scene entities paired with the bone name each one carries.
+        fn bones(&self) -> [(&'static str, Entity); 7] {
+            [
+                ("hips", self.hips),
+                ("spine", self.spine),
+                ("chest", self.chest),
+                ("neck", self.neck),
+                ("head", self.head),
+                ("leftEye", self.left_eye),
+                ("rightEye", self.right_eye),
+            ]
+        }
+    }
+
+    /// A scene the way `bevy_gltf` builds one: every node is an entity with a
+    /// `Transform` and a `GlobalTransform`, and `on_gltf_node` has put the
+    /// `VrmBone` on it (`nodes::process_node`).
+    fn gaze_scene(app: &mut App) -> GazeScene {
+        let world = app.world_mut();
+        let root = world
+            .spawn((Transform::default(), GlobalTransform::IDENTITY))
+            .id();
+        // The root bone is `setup_animation`'s animation root: the parent of
+        // `hips`.
+        let root_bone = world
+            .spawn((
+                Transform::default(),
+                GlobalTransform::IDENTITY,
+                ChildOf(root),
+            ))
+            .id();
+        let mut parent = root_bone;
+        let mut chain = Vec::with_capacity(GAZE_BONES.len());
+        for name in GAZE_BONES {
+            let entity = world
+                .spawn((
+                    Transform::default(),
+                    GlobalTransform::IDENTITY,
+                    VrmBone::from(name),
+                    ChildOf(parent),
+                ))
+                .id();
+            // The eyes hang off the head rather than continuing the chain.
+            parent = if name == "head" { entity } else { parent };
+            chain.push(entity);
+        }
+        // `chain` is exactly `GAZE_BONES` in order, so it is the node order.
+        let mut chain = chain.into_iter();
+        GazeScene {
+            root,
+            hips: chain.next().unwrap(),
+            spine: chain.next().unwrap(),
+            chest: chain.next().unwrap(),
+            neck: chain.next().unwrap(),
+            head: chain.next().unwrap(),
+            left_eye: chain.next().unwrap(),
+            right_eye: chain.next().unwrap(),
+        }
+    }
+
+    /// The load state of [`gaze_scene`]: node index `i` is the entity of
+    /// `GAZE_BONES[i]`, and the file declares the same humanoid map plus the
+    /// `lookAt` the eyes are driven by.
+    fn gaze_state(scene: &GazeScene) -> VrmLoadState {
+        let human_bones = GAZE_BONES
+            .iter()
+            .enumerate()
+            .map(|(index, name)| format!("\"{name}\": {{\"node\": {index}}}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let state = state_with(vrm(&format!(
+            r#"{{
+                "specVersion": "1.0",
+                "humanoid": {{"humanBones": {{{human_bones}}}}},
+                "lookAt": {{"offsetFromHeadBone": [0.0, 0.06, 0.0]}}
+            }}"#
+        )));
+        VrmLoadState {
+            bone_nodes: GAZE_BONES
+                .iter()
+                .enumerate()
+                .map(|(index, name)| ((*name).to_owned(), index))
+                .collect(),
+            node_entities: scene
+                .bones()
+                .into_iter()
+                .enumerate()
+                .map(|(index, (_, entity))| (index, entity))
+                .collect(),
+            ..state
+        }
+    }
+
+    /// Every step of [`finalize`] a gaze target depends on, in order.
+    ///
+    /// `finalize` itself is not callable here: it needs a `LoadContext`, and the
+    /// first-person pass inside it asks that context for a mesh handle. The steps
+    /// are the same functions `finalize` calls, which is what makes these tests
+    /// about the pipeline and not about a hand-written approximation of it.
+    fn finalize_for_gaze(
+        app: &mut App,
+        state: &VrmLoadState,
+        root: Entity,
+    ) {
+        insert_rest_transforms(app.world_mut(), root);
+        build_look_at(state, app.world_mut(), root);
+        setup_animation(state, app.world_mut(), root);
+        insert_humanoid_bone_holders(app.world_mut(), root);
+        mark_initialized(app.world_mut(), root);
+    }
+
+    /// The gaze systems address the bones *through* the avatar root, so without
+    /// the holders a pipeline scene's `LookAt` and `BodyTracking` do nothing at
+    /// all — the root carries the bone entities, not the bones.
+    #[test]
+    fn bone_holders_reach_the_scene_root() -> TestResult {
+        let mut app = test_app();
+        let scene = gaze_scene(&mut app);
+        let state = gaze_state(&scene);
+
+        finalize_for_gaze(&mut app, &state, scene.root);
+
+        let world = app.world();
+        // The holders the two gaze systems read.
+        assert_eq!(
+            world.get::<HeadBoneEntity>(scene.root).map(|head| head.0),
+            Some(scene.head),
+            "`track_looking_target` and `track_body_tracking` need the head"
+        );
+        assert_eq!(
+            world.get::<LeftEyeBoneEntity>(scene.root).map(|eye| eye.0),
+            Some(scene.left_eye)
+        );
+        assert_eq!(
+            world.get::<RightEyeBoneEntity>(scene.root).map(|eye| eye.0),
+            Some(scene.right_eye)
+        );
+        assert_eq!(
+            world.get::<NeckBoneEntity>(scene.root).map(|bone| bone.0),
+            Some(scene.neck),
+            "body tracking's optional chain bones resolve too"
+        );
+        assert_eq!(
+            world.get::<ChestBoneEntity>(scene.root).map(|bone| bone.0),
+            Some(scene.chest)
+        );
+        assert_eq!(
+            world.get::<SpineBoneEntity>(scene.root).map(|bone| bone.0),
+            Some(scene.spine)
+        );
+        assert_eq!(
+            world.get::<HipsBoneEntity>(scene.root).map(|bone| bone.0),
+            Some(scene.hips)
+        );
+        // A holder belongs to the root, not to a bone.
+        assert!(world.get::<HeadBoneEntity>(scene.hips).is_none());
+
+        // The bone's own marker rides on the bone.
+        assert!(world.get::<Head>(scene.head).is_some());
+        assert!(world.get::<LeftEye>(scene.left_eye).is_some());
+        assert!(world.get::<Hips>(scene.hips).is_some());
+        success!()
+    }
+
+    /// The whole point of the holders: the two gaze systems stop matching
+    /// nothing. The plugins are the crate's own, so the systems under test are
+    /// the scheduled ones rather than a hand-run copy of them, and
+    /// `BodyTracking`'s own observer supplies `SmoothedGaze`.
+    ///
+    /// Smoothing is switched off so the assertion does not depend on how long
+    /// the first frame's delta happens to be.
+    #[test]
+    fn gaze_control_is_no_longer_inert_on_a_pipeline_scene() -> TestResult {
+        let mut app = test_app();
+        app.add_plugins((LookAtPlugin, BodyTrackingPlugin));
+        let scene = gaze_scene(&mut app);
+        let state = gaze_state(&scene);
+
+        finalize_for_gaze(&mut app, &state, scene.root);
+
+        // Off to the right, slightly below the head: both a yaw and a pitch.
+        let target = app
+            .world_mut()
+            .spawn((
+                Transform::default(),
+                GlobalTransform::from_xyz(1.0, 0.5, 1.0),
+            ))
+            .id();
+        app.world_mut().entity_mut(scene.root).insert((
+            LookAt::Target(target),
+            BodyTracking {
+                smoothing: 0.0,
+                output_smoothing: 0.0,
+                ..Default::default()
+            },
+        ));
+
+        app.update();
+
+        let world = app.world();
+        // `track_looking_target` drove the eyes.
+        assert!(
+            turned(world, scene.left_eye),
+            "the left eye did not turn towards the target"
+        );
+        assert!(
+            turned(world, scene.right_eye),
+            "the right eye did not turn towards the target"
+        );
+        // `track_body_tracking` drove the chain, which is only reachable through
+        // `HeadBoneEntity` + the optional `Neck` / `Chest` / `Spine` holders.
+        for bone in [scene.spine, scene.chest, scene.neck, scene.head] {
+            assert!(turned(world, bone), "a body-tracking bone did not turn");
+        }
+        // The avatar root itself is not a gaze bone.
+        assert!(!turned(world, scene.root));
+        success!()
+    }
+
+    /// Whether an entity's rotation has left the identity at all.
+    fn turned(
+        world: &World,
+        entity: Entity,
+    ) -> bool {
+        world
+            .get::<Transform>(entity)
+            .is_some_and(|transform| transform.rotation.angle_between(Quat::IDENTITY) > 1e-3)
+    }
+
+    /// The source path of the file *is* observable at load time, so a pipeline
+    /// scene carries `VrmPath` exactly like a legacy one and
+    /// `RequestDetachVrm` has something to remove.
+    ///
+    /// What is pinned here is the observable `insert_source_path` reads, because
+    /// the function itself cannot be called from a test: `LoadContext::new` is
+    /// `pub(crate)` inside `bevy_asset`, and `finalize` needs a context for its
+    /// first-person pass besides. `AssetServer::load` builds the
+    /// `LoadContext` from exactly this [`AssetPath`]
+    /// (`server/mod.rs:1659-1661`), and `bevy_gltf` derives a scene's context
+    /// from the file's with `begin_labeled_asset`
+    /// (`loader/mod.rs:1025`), which clones the path and attaches the `Scene0`
+    /// label only when the asset is registered (`:1123-1126`).
+    #[test]
+    fn the_source_path_is_observable_on_a_scene_load_context() -> TestResult {
+        let loaded = bevy::asset::AssetPath::from("vrm/Elmer.vrm");
+
+        assert_eq!(
+            loaded.path(),
+            std::path::Path::new("vrm/Elmer.vrm"),
+            "`LoadContext::path` of a scene is the file's own path, not `Scene0` of it"
+        );
+        assert_eq!(
+            VrmPath::new(loaded.path()).0,
+            VrmPath::new("vrm/Elmer.vrm").0,
+            "and the pipeline spells it exactly as the legacy `VrmHandle` path does \
+             (`src/vrm/initialize.rs:116`)"
+        );
+        // The same holds for the labeled handle a caller spawns the scene from.
+        let labeled = bevy::asset::AssetPath::from("vrm/Elmer.vrm#Scene0");
+        assert_eq!(labeled.path(), loaded.path());
         success!()
     }
 }
