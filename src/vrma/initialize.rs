@@ -4,7 +4,7 @@ use crate::error::vrm_error;
 use crate::vrm::Initialized;
 use crate::vrm::humanoid_bone::HumanoidBoneRegistry;
 use crate::vrma::animation::animation_graph::RequestUpdateAnimationGraph;
-use crate::vrma::animation::expressions::VrmaExpressionNames;
+use crate::vrma::animation::expressions::VrmaExpressionRegistry;
 use crate::vrma::gltf::extensions::VrmaExtensions;
 use crate::vrma::loader::VrmaAsset;
 use crate::vrma::{VrmAnimationClipHandle, Vrma, VrmaDuration, VrmaHandle, VrmaPath};
@@ -91,7 +91,7 @@ fn spawn_vrma(
             WorldAssetRoot(scene_root),
             VrmaDuration(obtain_vrma_duration(&clip_assets, &vrma.gltf.animations)),
             VrmaPath(vrma_path),
-            VrmaExpressionNames::new(&extensions),
+            VrmaExpressionRegistry::new(&extensions, &node_assets, &vrma.gltf.nodes),
             HumanoidBoneRegistry::new(
                 &extensions.vrmc_vrm_animation.humanoid.human_bones,
                 &node_assets,

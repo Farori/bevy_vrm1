@@ -24,14 +24,6 @@ impl ChildSearcher<'_, '_> {
         self.find_from_name(vrm, Vrm::ROOT_BONE)
     }
 
-    #[inline]
-    pub fn find_expressions_root(
-        &self,
-        vrm: Entity,
-    ) -> Option<Entity> {
-        self.find_from_name(vrm, Vrm::EXPRESSIONS_ROOT)
-    }
-
     pub fn find_from_name(
         &self,
         root: Entity,

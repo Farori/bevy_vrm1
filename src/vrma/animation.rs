@@ -10,7 +10,6 @@ mod properties;
 use crate::prelude::VrmSystemSets;
 use crate::vrma::RetargetSource;
 use crate::vrma::animation::animation_graph::VrmaAnimationGraphPlugin;
-use crate::vrma::animation::expressions::VrmaRetargetExpressionsPlugin;
 use crate::vrma::animation::play::VrmaAnimationPlayPlugin;
 use bevy::app::App;
 use bevy::prelude::*;
@@ -37,11 +36,7 @@ impl Plugin for VrmaAnimationPlayersPlugin {
         app: &mut App,
     ) {
         app.register_type::<VrmaAnimationPlayers>()
-            .add_plugins((
-                VrmaAnimationGraphPlugin,
-                VrmaAnimationPlayPlugin,
-                VrmaRetargetExpressionsPlugin,
-            ))
+            .add_plugins((VrmaAnimationGraphPlugin, VrmaAnimationPlayPlugin))
             .add_systems(
                 PostUpdate,
                 request_redraw

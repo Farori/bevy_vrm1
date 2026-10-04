@@ -1,6 +1,8 @@
 use crate::prelude::ChildSearcher;
 use crate::vrm::spring_bone::{SpringJointState, SpringRoot};
 use crate::vrma::VrmAnimationNodeIndex;
+use crate::vrma::animation::expressions::{VrmaExpressionRegistry, reset_expression_weights};
+use crate::vrma::animation::properties::VrmExpressionWeights;
 use bevy::animation::{AnimationPlayer, RepeatAnimation};
 use bevy::app::{App, Plugin};
 use bevy::prelude::*;
@@ -72,6 +74,8 @@ fn apply_play_vrma(
     parents: Query<&ChildOf>,
     childrens: Query<&Children>,
     vrmas: Query<&VrmAnimationNodeIndex>,
+    expression_registries: Query<&VrmaExpressionRegistry>,
+    mut roots: Query<&mut VrmExpressionWeights>,
     spring_roots: Query<&SpringRoot>,
     mut joint_states: Query<&mut SpringJointState>,
 ) {
@@ -90,14 +94,11 @@ fn apply_play_vrma(
         &searcher,
         &mut players,
     );
-    play_expression_animations(
-        *vrm_entity,
-        node_index.0,
-        trigger.repeat,
-        &mut players,
-        &childrens,
-        &searcher,
-    );
+    // The expression tracks are nodes of the same clip, so the same player and
+    // the same `repeat` drive them. What still needs doing is the neutral face
+    // the transition blends out of: without it a clip that fades in over 300 ms
+    // fades out of whatever the previous one left behind.
+    reset_expression_weights(vrma_entity, &expression_registries, &mut roots, &parents);
     if trigger.reset_spring_bones {
         reset_spring_bone_velocities(*vrm_entity, &spring_roots, &mut joint_states, &childrens);
     }
@@ -149,61 +150,34 @@ fn play_humanoid_bone_animation(
         .set_repeat(repeat);
 }
 
-fn play_expression_animations(
-    vrm: Entity,
-    node_index: AnimationNodeIndex,
-    repeat: RepeatAnimation,
-    entities: &mut Query<(
-        &mut Transform,
-        &mut AnimationPlayer,
-        Option<&mut AnimationTransitions>,
-    )>,
-    childrens: &Query<&Children>,
-    searcher: &ChildSearcher,
-) {
-    let Some(expressions_root) = searcher.find_expressions_root(vrm) else {
-        return;
-    };
-    let Ok(children) = childrens.get(expressions_root) else {
-        return;
-    };
-    for child in children.into_iter().copied() {
-        if let Ok((mut tf, mut player, _)) = entities.get_mut(child) {
-            // Reset the expression weight to zero.
-            tf.translation.x = 0.0;
-            player.stop_all();
-            player.play(node_index).set_repeat(repeat);
-        };
-    }
-}
-
 fn apply_stop_vrma(
     trigger: On<StopVrma>,
-    mut rig_entities: Query<&mut AnimationPlayer>,
+    mut players: Query<&mut AnimationPlayer>,
     vrmas: Query<&VrmAnimationNodeIndex>,
-    rig_children: Query<&Children>,
+    parents: Query<&ChildOf>,
+    expression_registries: Query<&VrmaExpressionRegistry>,
+    mut roots: Query<&mut VrmExpressionWeights>,
+    searcher: ChildSearcher,
 ) {
     let vrma_entity = trigger.event_target();
+    let Ok(ChildOf(vrm)) = parents.get(vrma_entity) else {
+        return;
+    };
     let Ok(node_index) = vrmas.get(vrma_entity) else {
         return;
     };
-    stop_animations(vrma_entity, node_index.0, &mut rig_entities, &rig_children);
-}
-
-fn stop_animations(
-    entity: Entity,
-    node_index: AnimationNodeIndex,
-    rig_entities: &mut Query<&mut AnimationPlayer>,
-    rig_children: &Query<&Children>,
-) {
-    if let Ok(mut player) = rig_entities.get_mut(entity) {
-        player.stop(node_index);
-    };
-    if let Ok(children) = rig_children.get(entity) {
-        for child in children.into_iter().copied() {
-            stop_animations(child, node_index, rig_entities, rig_children);
-        }
+    // The player is on the avatar's root bone — the same entity
+    // `play_humanoid_bone_animation` starts it on — and the node it holds plays
+    // the bone curves *and* the expression curves of this very `.vrma`, so one
+    // `stop` covers the face as well as the body.
+    if let Some(root_bone) = searcher.find_root_bone(*vrm)
+        && let Ok(mut player) = players.get_mut(root_bone)
+    {
+        player.stop(node_index.0);
     }
+    // A finished animation would otherwise leave the face frozen at its last
+    // weight, since the weight lives in a map nothing else decays.
+    reset_expression_weights(vrma_entity, &expression_registries, &mut roots, &parents);
 }
 
 #[cfg(test)]

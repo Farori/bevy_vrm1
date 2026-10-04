@@ -10,6 +10,7 @@ use crate::vrma::animation::bone_rotation::{
 use crate::vrma::animation::bone_translation::{
     RetargetTranslationTable, compute_hips_transformation,
 };
+use crate::vrma::animation::expressions::{VrmaExpressionRegistry, retarget_expression_curves};
 use crate::vrma::animation::mask::mask_group_for_bone;
 use crate::vrma::{LoadedVrma, VrmAnimationClipHandle, VrmAnimationNodeIndex};
 use bevy::animation::{AnimationTargetId, animated_field};
@@ -41,7 +42,7 @@ impl Plugin for VrmaAnimationGraphPlugin {
         app: &mut App,
     ) {
         app.add_observer(apply_animation_graph)
-            .add_observer(apply_replace_humanoid_bone_animation_clips)
+            .add_observer(apply_retarget_animation_clips)
             .add_systems(Update, apply_bake_clips);
     }
 }
@@ -53,7 +54,6 @@ fn apply_animation_graph(
     childrens: Query<&Children>,
     vrmas: Query<(Entity, &VrmAnimationClipHandle, Has<ClipRetargetRequested>)>,
     child_searcher: ChildSearcher,
-    entities: Query<(Has<AnimationPlayer>, Option<&AnimationGraphHandle>)>,
     bones: Query<(&VrmBone, &AnimationTargetId)>,
 ) {
     let vrm_entity = trigger.vrm;
@@ -63,20 +63,16 @@ fn apply_animation_graph(
     let mut animation_graph = generate_animation_graph(&mut commands, &vrmas, children);
     register_mask_groups(&mut animation_graph, &bones);
     let animation_graph_handle = AnimationGraphHandle(graphs.add(animation_graph));
+    // One graph per avatar, and it goes on the root bone: the root bone is the
+    // entity every target of this graph names through `AnimatedBy`
+    // (`handler::scene::setup_animation`), so it is the only entity whose player
+    // can play any clip of it. A `.vrma`'s expression tracks are nodes of the
+    // same graph, so they need no graph of their own.
     insert_animation_graph_into_root_bone(
         vrm_entity,
-        animation_graph_handle.clone(),
+        animation_graph_handle,
         &mut commands,
         &child_searcher,
-    );
-    insert_animation_graph_into_expressions(
-        trigger.vrm,
-        &mut commands,
-        &mut graphs,
-        &animation_graph_handle,
-        &entities,
-        &child_searcher,
-        &childrens,
     );
     // Fan out to every new clip, exactly once. Previous clips already contain
     // destination-space curves and must not be retargeted again on a rebuild.
@@ -157,52 +153,30 @@ fn insert_animation_graph_into_root_bone(
     commands.entity(root_bone).insert(animation_graph_handle);
 }
 
-fn insert_animation_graph_into_expressions(
-    entity: Entity,
-    commands: &mut Commands,
-    graphs: &mut Assets<AnimationGraph>,
-    animation_graph_handle: &AnimationGraphHandle,
-    expressions: &Query<(Has<AnimationPlayer>, Option<&AnimationGraphHandle>)>,
-    searcher: &ChildSearcher,
-    childrens: &Query<&Children>,
-) {
-    let Some(expressions_root) = searcher.find_expressions_root(entity) else {
-        return;
-    };
-    let Ok(expression_children) = childrens.get(expressions_root) else {
-        return;
-    };
-    for expression in expression_children.iter() {
-        let Ok((has_player, previous_handle)) = expressions.get(expression) else {
-            continue;
-        };
-        if let Some(previous_handle) = previous_handle {
-            graphs.remove(previous_handle);
-        }
-        if has_player {
-            commands
-                .entity(expression)
-                .insert(animation_graph_handle.clone());
-        }
-    }
-}
-
-fn apply_replace_humanoid_bone_animation_clips(
+/// Points one `.vrma` clip at the avatar: the humanoid bone curves onto the
+/// avatar's own bone targets, the expression tracks onto the avatar root's
+/// synthetic target.
+///
+/// Both halves write into the *same* `AnimationClip` asset, which is what makes
+/// one graph node play the face and the body together — and therefore what makes
+/// a single `RepeatAnimation` and a single `StopVrma` cover both.
+fn apply_retarget_animation_clips(
     trigger: On<RequestUpdateAnimationClips>,
     mut commands: Commands,
     mut clips: ResMut<Assets<AnimationClip>>,
     clip_handles: Query<&VrmAnimationClipHandle>,
     parents: Query<&ChildOf>,
     vrms: Query<&HumanoidBoneRegistry>,
+    expression_registries: Query<&VrmaExpressionRegistry>,
     bones: Query<(&RestTransform, &RestGlobalTransform, &AnimationTargetId)>,
     model_rests: Query<&RestWorldTransform>,
+    // The `.vrma`'s expression nodes carry no rest transforms, so they are not
+    // in `bones`; the expression retarget only needs their target ids.
+    source_targets: Query<&AnimationTargetId>,
     searcher: ChildSearcher,
 ) {
     let vrma_entity = trigger.event_target();
     let Ok(ChildOf(vrm_entity)) = parents.get(vrma_entity) else {
-        return;
-    };
-    let Ok(registry) = vrms.get(vrma_entity) else {
         return;
     };
     let Ok(vrm_animation_clip_handle) = clip_handles.get(vrma_entity) else {
@@ -215,39 +189,60 @@ fn apply_replace_humanoid_bone_animation_clips(
     let Some(mut clip) = clips.get_mut(vrm_animation_clip_handle.0.id()) else {
         return;
     };
-    let transformations = compute_rotation_transformations(
-        vrma_entity,
-        *vrm_entity,
-        root_bone,
-        registry,
-        &searcher,
-        &bones,
-        &model_rests,
-    );
-    for (bone_entity, vrma_entity, transformation) in transformations {
-        commands
-            .entity(bone_entity)
-            .entry::<RetargetRotationTable>()
-            .and_modify(move |mut table| {
-                table.0.insert(vrma_entity, transformation);
-            })
-            .or_insert(RetargetRotationTable(HashMap::from([(
-                vrma_entity,
-                transformation,
-            )])));
+    // The humanoid map describes the *source* rig, so it is read off the `.vrma`
+    // entity — `initialize::spawn_vrma` writes it there, next to
+    // `VrmAnimationClipHandle`. A `.vrma` that declares no `humanoid` block has
+    // an empty map, never a missing one, so the two retargets below can be
+    // gated independently: an expression-only `.vrma` still needs its curves
+    // moved, and a bone-only one needs no `expressions`.
+    if let Ok(registry) = vrms.get(vrma_entity) {
+        let transformations = compute_rotation_transformations(
+            vrma_entity,
+            *vrm_entity,
+            root_bone,
+            registry,
+            &searcher,
+            &bones,
+            &model_rests,
+        );
+        for (bone_entity, vrma_entity, transformation) in transformations {
+            commands
+                .entity(bone_entity)
+                .entry::<RetargetRotationTable>()
+                .and_modify(move |mut table| {
+                    table.0.insert(vrma_entity, transformation);
+                })
+                .or_insert(RetargetRotationTable(HashMap::from([(
+                    vrma_entity,
+                    transformation,
+                )])));
+        }
+        replace_bone_animation_clips(
+            &mut commands,
+            &mut clip,
+            vrma_entity,
+            *vrm_entity,
+            root_bone,
+            registry,
+            &searcher,
+            &bones,
+            &model_rests,
+        );
+        commands.entity(vrma_entity).insert(NeedsBake);
     }
-    replace_bone_animation_clips(
-        &mut commands,
-        &mut clip,
-        vrma_entity,
-        *vrm_entity,
-        root_bone,
-        registry,
-        &searcher,
-        &bones,
-        &model_rests,
-    );
-    commands.entity(vrma_entity).insert(NeedsBake);
+    // Expression tracks ride in the same clip asset, so one graph node plays the
+    // face and the body together and `StopVrma` stops both. The root target is
+    // outside the bone-root subtree `apply_bake_clips` collects, so the bake pass
+    // leaves these curves alone.
+    if let Ok(expressions) = expression_registries.get(vrma_entity) {
+        retarget_expression_curves(
+            &mut clip,
+            vrma_entity,
+            expressions,
+            &searcher,
+            &source_targets,
+        );
+    }
 }
 
 /// Moves every source curve of `registry` onto the avatar's own bone target.
