@@ -70,7 +70,27 @@ pub(crate) fn finalize(
     setup_animation(state, scene_world, world_root_id);
     apply_first_person(state, load_context, scene_world);
 
-    scene_world.entity_mut(world_root_id).insert(Initialized);
+    mark_initialized(scene_world, world_root_id);
+}
+
+/// The two markers every other system treats as "this scene is a fully
+/// initialized avatar".
+///
+/// * [`Vrm`] is the crate's avatar-root marker. Legacy `spawn_vrm` inserts it
+///   (`src/vrm/initialize.rs:72`), and
+///   [`ParentSearcher::find_vrm`](crate::system_param::ParentSearcher::find_vrm),
+///   [`VrmDetachPlugin`](crate::vrm::detach::VrmDetachPlugin) and body tracking
+///   (`src/vrm/body_tracking.rs:265`) all key on it, so a scene born from a
+///   `WorldAssetRoot` needs it too or it is invisible to all of them.
+/// * [`Initialized`] is what the VRMA loader waits for on the parent before it
+///   spawns a `VrmaHandle` child (`src/vrma/initialize.rs:38-44`), and what
+///   `trigger_loaded` watches to request the animation graph
+///   (`src/vrma/initialize.rs:119`).
+fn mark_initialized(
+    world: &mut World,
+    root: Entity,
+) {
+    world.entity_mut(root).insert((Vrm, Initialized));
 }
 
 /// Snapshots the rest pose of the whole scene.
@@ -498,54 +518,73 @@ fn build_look_at(
 /// animations (`loader/mod.rs:1557-1560`); a `.vrm` declares no glTF animation in
 /// practice, so no path id exists to clobber, and the two systems are separated
 /// by `AnimatedBy` anyway — `bevy_gltf`'s targets point at the animation root it
-/// picked, ours point at the scene root.
+/// picked, ours point at [`Vrm::ROOT_BONE`].
 ///
-/// # Why the player sits on the scene root
+/// # Why the player sits on the root bone, not on the scene root
 ///
-/// `bevy_gltf` puts its own `AnimationPlayer` on each *animation root* node
-/// (`loader/mod.rs:1089-1095`). That is a different entity from the scene root,
-/// and it only exists for files with glTF animations. Putting the VRM player on
-/// the scene root instead gives one player per avatar instance — which is what
-/// `AnimatedBy(root)` and every mask-group lookup expects — and lets the VRMA
-/// commit attach one `AnimationGraphHandle` to it.
+/// bevy resolves a target's player through the entity named by its
+/// [`AnimatedBy`] component, and that entity must carry both an
+/// `AnimationPlayer` and an `AnimationGraphHandle`
+/// (`bevy_animation/src/lib.rs:1097-1115`). The VRMA side writes the graph
+/// handle onto the **root bone** (`insert_animation_graph_into_root_bone` in
+/// `src/vrma/animation/animation_graph.rs:151`),
+/// [`PlayVrma`](crate::prelude::PlayVrma) plays on the **root bone**
+/// (`src/vrma/animation/play.rs:141-149`), and
+/// [`VrmAnimation::all_finished`](crate::prelude::VrmAnimation::all_finished)
+/// reads the **root bone**'s player. So the root bone is the animation root and
+/// every target has to name it — which is exactly what legacy
+/// `apply_initialize_humanoid_bones` produces (`src/vrm/humanoid_bone.rs:158-167`,
+/// `:186`). A player left on the scene root would never be the player of any
+/// target, i.e. inert.
 ///
-/// The scene root also carries the synthetic target
+/// The scene root still carries the synthetic target
 /// [`vrm_root_animation_target`], so curves that address the avatar as a whole
-/// (expression weights) have something to bind to.
+/// (expression weights) have something to bind to, and it is a target of the same
+/// player.
 fn setup_animation(
     state: &VrmLoadState,
     world: &mut World,
     root: Entity,
 ) {
+    // The root bone is the parent of `hips`, exactly as the legacy path defines
+    // it (`src/vrm/humanoid_bone.rs:154-168`): `ChildSearcher::find_root_bone`
+    // and the VRMA retarget both look it up by `Vrm::ROOT_BONE`.
+    let root_bone = state
+        .bone_nodes
+        .get("hips")
+        .and_then(|node| state.node_entities.get(node))
+        .copied()
+        .and_then(|hips| world.get::<ChildOf>(hips).map(ChildOf::parent));
+    // A file without a `hips` bone has no root bone and therefore no humanoid
+    // rig at all. Fall back to the scene root so a user-supplied graph still has
+    // a player; the VRMA path cannot attach to a rig that does not exist, and
+    // it bails on `find_root_bone` first anyway.
+    let animation_root = root_bone.unwrap_or(root);
+
     for (bone, node) in &state.bone_nodes {
         let Some(&entity) = state.node_entities.get(node) else {
             continue;
         };
-        world
-            .entity_mut(entity)
-            .insert((bone_target_id(bone), AnimatedBy(root), RetargetSource));
+        world.entity_mut(entity).insert((
+            bone_target_id(bone),
+            AnimatedBy(animation_root),
+            RetargetSource,
+        ));
     }
 
-    world.entity_mut(root).insert((
-        vrm_root_animation_target(),
-        AnimatedBy(root),
-        AnimationPlayer::default(),
-    ));
+    world
+        .entity_mut(root)
+        .insert((vrm_root_animation_target(), AnimatedBy(animation_root)));
 
-    // The root bone is the parent of `hips`, exactly as the legacy path defines
-    // it (`src/vrm/humanoid_bone.rs:154-168`): `ChildSearcher::find_root_bone`
-    // and the VRMA retarget both look it up by `Vrm::ROOT_BONE`.
-    let hips = state
-        .bone_nodes
-        .get("hips")
-        .and_then(|node| state.node_entities.get(node))
-        .copied();
-    if let Some(root_bone) = hips.and_then(|hips| world.get::<ChildOf>(hips).map(ChildOf::parent)) {
+    if let Some(root_bone) = root_bone {
         world.entity_mut(root_bone).insert((
             Name::new(Vrm::ROOT_BONE),
+            AnimationPlayer::default(),
             AnimationTransitions::default(),
             RetargetSource,
         ));
+    } else {
+        world.entity_mut(root).insert(AnimationPlayer::default());
     }
 }
 
@@ -976,7 +1015,10 @@ mod tests {
     fn animation_targets_are_attached_to_the_root_and_the_bones() -> TestResult {
         let mut world = World::new();
         let root = world.spawn_empty().id();
-        let hips = world.spawn(ChildOf(root)).id();
+        // Distinct from the scene root, because the two carry different roles:
+        // the root bone is the animation root.
+        let root_bone = world.spawn(ChildOf(root)).id();
+        let hips = world.spawn(ChildOf(root_bone)).id();
         let state = VrmLoadState {
             bone_nodes: [("hips".to_owned(), 0)].into_iter().collect(),
             node_entities: [(0, hips)].into_iter().collect(),
@@ -985,7 +1027,6 @@ mod tests {
 
         setup_animation(&state, &mut world, root);
 
-        assert!(world.get::<AnimationPlayer>(root).is_some());
         assert_eq!(
             world.get::<AnimationTargetId>(root).copied(),
             Some(vrm_root_animation_target()),
@@ -996,18 +1037,67 @@ mod tests {
             Some(bone_target_id("hips")),
             "a bone is addressed by its VRM bone name, so one clip retargets to any avatar"
         );
+        // Both the root and the bone are targets of the player on the root bone,
+        // which is where the VRMA graph handle is written.
         assert_eq!(
             world.get::<AnimatedBy>(hips).map(|animated| animated.0),
-            Some(root),
-            "both are driven by the scene root's player"
+            Some(root_bone)
+        );
+        assert_eq!(
+            world.get::<AnimatedBy>(root).map(|animated| animated.0),
+            Some(root_bone)
         );
         // `ChildSearcher::find_root_bone` and the VRMA retarget look the root
-        // bone up by this name.
+        // bone up by this name, and `PlayVrma` plays on the player it holds.
         assert_eq!(
-            world.get::<Name>(root).map(|name| name.as_str()),
+            world.get::<Name>(root_bone).map(|name| name.as_str()),
             Some(Vrm::ROOT_BONE)
         );
-        assert!(world.get::<AnimationTransitions>(root).is_some());
+        assert!(world.get::<AnimationPlayer>(root_bone).is_some());
+        assert!(world.get::<AnimationTransitions>(root_bone).is_some());
+        assert!(world.get::<RetargetSource>(root_bone).is_some());
+        // The scene root is not the animation root, so it must not hold a
+        // player of its own: no `AnimatedBy` points at it.
+        assert!(world.get::<AnimationPlayer>(root).is_none());
+        success!()
+    }
+
+    /// `Vrm` and `Initialized` are the two markers every other system treats as
+    /// "this scene is a fully initialized avatar", and neither exists on a bare
+    /// scene root.
+    #[test]
+    fn finalize_marks_the_scene_root_as_a_vrm() -> TestResult {
+        let mut world = World::new();
+        let root = world.spawn_empty().id();
+
+        mark_initialized(&mut world, root);
+
+        assert!(world.get::<Vrm>(root).is_some());
+        assert!(world.get::<Initialized>(root).is_some());
+        success!()
+    }
+
+    /// A file that declares no `hips` bone has no root bone. The scene root then
+    /// keeps the player, so a user-supplied graph still has somewhere to live.
+    #[test]
+    fn a_scene_without_hips_keeps_a_player_on_the_scene_root() -> TestResult {
+        let mut world = World::new();
+        let root = world.spawn_empty().id();
+        let spine = world.spawn(ChildOf(root)).id();
+        let state = VrmLoadState {
+            bone_nodes: [("spine".to_owned(), 0)].into_iter().collect(),
+            node_entities: [(0, spine)].into_iter().collect(),
+            ..Default::default()
+        };
+
+        setup_animation(&state, &mut world, root);
+
+        assert!(world.get::<AnimationPlayer>(root).is_some());
+        assert_eq!(
+            world.get::<AnimatedBy>(spine).map(|animated| animated.0),
+            Some(root),
+            "without a root bone the scene root is the only animation root"
+        );
         success!()
     }
 

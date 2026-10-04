@@ -1,4 +1,6 @@
-use crate::prelude::{ChildSearcher, RestGlobalTransform, RestTransform, RestWorldTransform};
+use crate::prelude::{
+    ChildSearcher, RestGlobalTransform, RestTransform, RestWorldTransform, VrmBone,
+};
 use crate::vrm::Vrm;
 use crate::vrm::expressions::VrmExpressionRegistry;
 use crate::vrm::humanoid_bone::HumanoidBoneRegistry;
@@ -9,6 +11,7 @@ use crate::vrma::animation::bone_rotation::{
 use crate::vrma::animation::bone_translation::{
     RetargetTranslationTable, compute_hips_transformation,
 };
+use crate::vrma::animation::mask::mask_group_for_bone;
 use crate::vrma::{LoadedVrma, VrmAnimationClipHandle, VrmAnimationNodeIndex};
 use bevy::animation::{AnimationTargetId, animated_field};
 use bevy::app::App;
@@ -53,12 +56,14 @@ fn apply_animation_graph(
     vrmas: Query<(Entity, &VrmAnimationClipHandle, Has<ClipRetargetRequested>)>,
     child_searcher: ChildSearcher,
     entities: Query<(Has<AnimationPlayer>, Option<&AnimationGraphHandle>)>,
+    bones: Query<(&VrmBone, &AnimationTargetId)>,
 ) {
     let vrm_entity = trigger.vrm;
     let Ok(children) = childrens.get(vrm_entity) else {
         return;
     };
-    let animation_graph = generate_animation_graph(&mut commands, &vrmas, children);
+    let mut animation_graph = generate_animation_graph(&mut commands, &vrmas, children);
+    register_mask_groups(&mut animation_graph, &bones);
     let animation_graph_handle = AnimationGraphHandle(graphs.add(animation_graph));
     insert_animation_graph_into_root_bone(
         vrm_entity,
@@ -109,6 +114,38 @@ fn generate_animation_graph(
             .insert(VrmAnimationNodeIndex(nodes[i]));
     }
     graph
+}
+
+/// Puts every humanoid bone's [`AnimationTargetId`] into its `VrmMaskGroup`,
+/// which is what makes `VrmaMask` a working knob: bevy skips a clip node for a
+/// target whose own group mask intersects the node's computed mask
+/// (`bevy_animation/src/lib.rs:1192-1201`), so a layer can be masked down to
+/// part of the body by setting one node's `mask`.
+///
+/// # Why these are the destination ids
+///
+/// The ids registered are the ones `replace_bone_animation_clips` writes the
+/// curves onto — `AnimationTargetId::from_name` of the VRM bone name, put on the
+/// bone by `handler::scene::setup_animation` (pipeline scenes) or by
+/// `apply_initialize_humanoid_bones` (legacy scenes). Registering a source id
+/// instead would mask a rig that is never played, because the source curves are
+/// *moved* rather than copied.
+///
+/// # Why the query is world-wide
+///
+/// A graph belongs to one avatar, but a bone's mask group is a property of the
+/// bone, not of the graph, and the same avatar may be reached through several
+/// graphs. One pass over every entity that carries both components therefore
+/// keeps every graph consistent, and a target that belongs to no rig at all is
+/// inert: an unregistered target has mask `0`
+/// (`bevy_animation/src/lib.rs:1123-1128`).
+fn register_mask_groups(
+    graph: &mut AnimationGraph,
+    bones: &Query<(&VrmBone, &AnimationTargetId)>,
+) {
+    for (bone, target) in bones.iter() {
+        graph.add_target_to_mask_group(*target, mask_group_for_bone(&bone.0) as u32);
+    }
 }
 
 fn insert_animation_graph_into_root_bone(
@@ -216,6 +253,25 @@ fn apply_replace_humanoid_bone_animation_clips(
     commands.entity(vrma_entity).insert(NeedsBake);
 }
 
+/// Moves every source curve of `registry` onto the avatar's own bone target.
+///
+/// # The two lookups are deliberately different
+///
+/// * the **destination** bone is found by its [`VrmBone`] component
+///   (`find_by_bone_name`), which is what `handler::scene::setup_animation`
+///   writes for a load-time scene and what `apply_initialize_humanoid_bones`
+///   writes for a legacy one;
+/// * the **source** bone is found by the glTF node `Name` the registry was built
+///   from, because `HumanoidBoneRegistry` maps `VrmBone -> Name` and a `.vrma`
+///   is still loaded by the legacy `VrmaLoaderPlugin` (`vrma/loader.rs:14`).
+///
+/// Switching the source lookup to `VrmBone` as well would remove the last
+/// name-based step — glTF node names are optional and collide inside one file,
+/// and a collision resolves two bones to the same entity — but it has to happen
+/// in `compute_rotation_transformations` (`bone_rotation.rs`) at the same time,
+/// or the retarget table would be computed for one entity while the curves are
+/// moved onto another. Both source and destination bones already carry
+/// `VrmBone`, so that change is a two-line follow-up with no schema impact.
 fn replace_bone_animation_clips(
     commands: &mut Commands,
     clip: &mut AnimationClip,
@@ -481,9 +537,15 @@ fn apply_regenerate_expression_clips(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::prelude::{Initialized, LoadedVrma, VrmBone, Vrma};
+    use crate::prelude::{Initialized, LoadedVrma, VrmBone, Vrma, vrm_root_animation_target};
+    use crate::success;
+    use crate::tests::TestResult;
     use crate::vrm::gltf::extensions::VrmNode;
-    use bevy::animation::AnimationEntityMut;
+    use crate::vrm::gltf::handler::bone_target_id;
+    use crate::vrma::RetargetSource;
+    use crate::vrma::animation::mask::{VrmMaskGroup, VrmaMask};
+    use bevy::animation::graph::{AnimationMask, AnimationNodeType};
+    use bevy::animation::{AnimatedBy, AnimationEntityMut, AnimationPlugin};
     use bevy::gltf::GltfNode;
 
     #[derive(Resource, Default)]
@@ -527,6 +589,189 @@ mod tests {
             ChildOf(root),
         ));
         vrm
+    }
+
+    /// The destination avatar exactly as `handler::scene` writes it, which
+    /// differs from [`spawn_rig`] in the two ways that matter to the graph
+    /// build: the scene root is a *different* entity from the root bone, and the
+    /// root bone — the animation root — carries the player.
+    ///
+    /// Returns `(vrm, root_bone, spine)`.
+    fn spawn_pipeline_rig(
+        world: &mut World,
+        rest_rotation: Quat,
+    ) -> (Entity, Entity, Entity) {
+        let prefix = GlobalTransform::from(
+            Transform::from_xyz(3.0, 2.0, -1.0).with_rotation(Quat::from_rotation_y(0.3)),
+        );
+        let vrm = world
+            .spawn((Vrm, Initialized, RestWorldTransform(prefix)))
+            .id();
+        let root_bone = world
+            .spawn((
+                Name::new(Vrm::ROOT_BONE),
+                Transform::default(),
+                AnimationPlayer::default(),
+                AnimationTransitions::default(),
+                RetargetSource,
+                ChildOf(vrm),
+            ))
+            .id();
+        world
+            .entity_mut(vrm)
+            .insert((vrm_root_animation_target(), AnimatedBy(root_bone)));
+        let rest = Transform::from_rotation(rest_rotation);
+        let spine = world
+            .spawn((
+                VrmBone::from("spine"),
+                bone_target_id("spine"),
+                AnimatedBy(root_bone),
+                RetargetSource,
+                Transform::default(),
+                RestTransform(rest),
+                RestGlobalTransform(prefix.mul_transform(rest)),
+                ChildOf(root_bone),
+            ))
+            .id();
+        (vrm, root_bone, spine)
+    }
+
+    /// The retarget table and the destination-space curves are what
+    /// `PlayVrma` needs to move a bone, so their presence is the acceptance
+    /// criterion for a load-time scene.
+    #[test]
+    fn a_hand_built_pipeline_root_is_accepted_by_the_graph_build() -> TestResult {
+        let mut app = setup_app();
+        let (vrm, root_bone, spine) = spawn_pipeline_rig(app.world_mut(), Quat::IDENTITY);
+        let (vrma, clip) = spawn_clip(app.world_mut(), vrm, 0.5);
+
+        request_graph(&mut app, vrm);
+
+        // The graph goes on the root bone, which is where `find_root_bone`
+        // resolves it and where `PlayVrma` plays it.
+        assert!(app.world().get::<AnimationGraphHandle>(root_bone).is_some());
+        assert!(app.world().get::<AnimationPlayer>(root_bone).is_some());
+        // `apply_play_vrma` bails without this, and the index has to address a
+        // node of the graph the root bone now points at.
+        let node = app.world().get::<VrmAnimationNodeIndex>(vrma).unwrap().0;
+        let graph = app
+            .world()
+            .get::<AnimationGraphHandle>(root_bone)
+            .unwrap()
+            .clone();
+        assert!(matches!(
+            app.world()
+                .resource::<Assets<AnimationGraph>>()
+                .get(&graph)
+                .unwrap()
+                .graph
+                .node_weight(node)
+                .unwrap()
+                .node_type,
+            AnimationNodeType::Clip(_)
+        ));
+        // The retarget resolved the destination bone by `VrmBone`, not by name.
+        assert!(app.world().get::<RetargetRotationTable>(spine).is_some());
+        let curves = app
+            .world()
+            .resource::<Assets<AnimationClip>>()
+            .get(&clip)
+            .unwrap()
+            .curves();
+        assert!(
+            curves.contains_key(&bone_target_id("spine")),
+            "the clip must address the avatar by VRM bone name"
+        );
+        assert_eq!(app.world().resource::<LoadNotifications>().0, vec![vrma]);
+        success!()
+    }
+
+    /// The mask groups the graph build registers are the ones bevy's evaluator
+    /// reads, so a layer masked to part of the body really does leave the rest
+    /// alone. `spine` is `VrmMaskGroup::UpperBody`, which `VrmaMask::LOWER_BODY`
+    /// hides.
+    #[test]
+    fn a_masked_node_does_not_move_a_bone_in_its_group() -> TestResult {
+        let mut app = crate::tests::test_app();
+        // bevy's own plugin, so the graph this crate builds is evaluated at all.
+        app.add_plugins((AnimationPlugin, VrmaAnimationGraphPlugin));
+        let (vrm, root_bone, spine) = spawn_pipeline_rig(app.world_mut(), Quat::IDENTITY);
+        let (vrma, _) = spawn_clip(app.world_mut(), vrm, 0.5);
+        request_graph(&mut app, vrm);
+
+        let node = app.world().get::<VrmAnimationNodeIndex>(vrma).unwrap().0;
+        let graph = app
+            .world()
+            .get::<AnimationGraphHandle>(root_bone)
+            .expect("the graph handle is on the root bone")
+            .clone();
+        assert_eq!(
+            mask_group_for_bone("spine"),
+            VrmMaskGroup::UpperBody,
+            "the fixture's bone is in the upper body"
+        );
+
+        // Masked: the layer must not touch the spine.
+        set_node_mask(&mut app, &graph, node, VrmaMask::LOWER_BODY);
+        play(&mut app, root_bone, node);
+        run_frames(&mut app);
+        assert_eq!(
+            app.world().get::<Transform>(spine).unwrap().rotation,
+            Quat::IDENTITY,
+            "a masked node must not move a bone in its mask group"
+        );
+
+        // Unmasked: the very same node now drives it.
+        set_node_mask(&mut app, &graph, node, VrmaMask::ALL);
+        run_frames(&mut app);
+        let rotation = app.world().get::<Transform>(spine).unwrap().rotation;
+        assert!(
+            rotation.angle_between(Quat::from_rotation_x(0.5)) < 0.001,
+            "an unmasked node must drive the bone, got {rotation:?}"
+        );
+        success!()
+    }
+
+    /// Sets one clip node's mask-out bitfield. `Assets::get_mut` emits
+    /// `AssetEvent::Modified`, which is what makes bevy rebuild its
+    /// `ThreadedAnimationGraph` (whose `computed_masks` the evaluator reads).
+    fn set_node_mask(
+        app: &mut App,
+        graph: &AnimationGraphHandle,
+        node: AnimationNodeIndex,
+        mask: AnimationMask,
+    ) {
+        let mut graphs = app.world_mut().resource_mut::<Assets<AnimationGraph>>();
+        let mut graph = graphs.get_mut(graph).expect("the graph asset exists");
+        graph
+            .graph
+            .node_weight_mut(node)
+            .expect("the clip node exists")
+            .mask = mask;
+    }
+
+    /// Starts a clip without a transition: `AnimationTransitions::play` ramps
+    /// the weight from zero over 300 ms, which is not what this test measures.
+    fn play(
+        app: &mut App,
+        root_bone: Entity,
+        node: AnimationNodeIndex,
+    ) {
+        app.world_mut()
+            .entity_mut(root_bone)
+            .get_mut::<AnimationPlayer>()
+            .expect("the root bone holds the player")
+            .play(node);
+    }
+
+    /// Three frames: the asset event that a tracked `Assets::get_mut` queues is
+    /// drained at the end of one `PostUpdate` and turned into threaded masks in
+    /// the next, and `animate_targets` is unordered against that rebuild, so the
+    /// third frame is the first whose evaluation is guaranteed to see it.
+    fn run_frames(app: &mut App) {
+        for _ in 0..3 {
+            app.update();
+        }
     }
 
     fn spawn_clip(
