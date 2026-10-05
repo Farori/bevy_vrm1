@@ -21,9 +21,10 @@ pub mod prelude {
         mask::{VrmMaskGroup, VrmaMask, mask_group_for_bone},
         play::{PlayVrma, StopVrma},
         properties::{
-            ExpressionMorphBinds, ExpressionSetting, ExpressionSettings, ExpressionWeightProperty,
-            MorphBind, MorphBindTable, VRM_ROOT_TARGET_NAME, VrmExpressionIndex,
-            VrmExpressionWeights, apply_expression_morph_binds, vrm_root_animation_target,
+            EffectiveExpressionWeights, ExpressionMorphBinds, ExpressionSetting,
+            ExpressionSettings, ExpressionWeightProperty, MorphBind, MorphBindTable,
+            VRM_ROOT_TARGET_NAME, VrmExpressionIndex, VrmExpressionWeights,
+            apply_expression_morph_binds, vrm_root_animation_target,
         },
     };
 }

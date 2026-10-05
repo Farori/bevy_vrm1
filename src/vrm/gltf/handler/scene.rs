@@ -39,10 +39,10 @@ use super::first_person::AutoClass;
 use super::{VrmLoadState, bone_target_id};
 use crate::error::vrm_warn;
 use crate::prelude::{
-    ConstraintExecutionOrder, ExpressionMorphBinds, ExpressionSetting, ExpressionSettings,
-    Initialized, MToonMaterial, MorphBind, PendingNodeConstraint, RestGlobalTransform,
-    RestTransform, RestWorldTransform, Vrm, VrmBone, VrmExpressionWeights, VrmHeadOnly,
-    VrmNodeConstraint, VrmPath, both_view_mesh_layers, first_person_only_mesh_layers,
+    ConstraintExecutionOrder, EffectiveExpressionWeights, ExpressionMorphBinds, ExpressionSetting,
+    ExpressionSettings, Initialized, MToonMaterial, MorphBind, PendingNodeConstraint,
+    RestGlobalTransform, RestTransform, RestWorldTransform, Vrm, VrmBone, VrmExpressionWeights,
+    VrmHeadOnly, VrmNodeConstraint, VrmPath, both_view_mesh_layers, first_person_only_mesh_layers,
     third_person_only_mesh_layers, vrm_root_animation_target,
 };
 use crate::vrm::expressions::{ExpressionCategory, ExpressionOverrideType};
@@ -418,6 +418,7 @@ fn build_expressions(
     };
 
     let mut weights = VrmExpressionWeights::default();
+    let mut finals = EffectiveExpressionWeights::default();
     let mut binds = ExpressionMorphBinds::default();
     let mut settings = ExpressionSettings::default();
 
@@ -472,6 +473,7 @@ fn build_expressions(
         }
 
         weights.0.insert(name.clone(), 0.0);
+        finals.0.insert(name.clone(), 0.0);
         binds.0.insert(name.clone(), bind_list);
         settings.0.insert(
             name.clone(),
@@ -489,7 +491,9 @@ fn build_expressions(
         );
     }
 
-    world.entity_mut(root).insert((weights, binds, settings));
+    world
+        .entity_mut(root)
+        .insert((weights, finals, binds, settings));
 }
 
 /// Puts the parsed `VRMC_vrm.lookAt` on the scene root.

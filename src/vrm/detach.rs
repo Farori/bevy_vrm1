@@ -9,7 +9,7 @@ use crate::vrm::{
     Initialized, RestGlobalTransform, RestTransform, RestWorldTransform, Vrm, VrmBone, VrmPath,
 };
 use crate::vrma::animation::prelude::{
-    ExpressionMorphBinds, ExpressionSettings, VrmExpressionWeights,
+    EffectiveExpressionWeights, ExpressionMorphBinds, ExpressionSettings, VrmExpressionWeights,
 };
 use bevy::prelude::*;
 use bevy::world_serialization::{WorldAsset, WorldAssetRoot};
@@ -137,6 +137,7 @@ fn remove_vrm_components(
         .try_remove::<ConstraintExecutionOrder>()
         // Expressions.
         .try_remove::<VrmExpressionWeights>()
+        .try_remove::<EffectiveExpressionWeights>()
         .try_remove::<ExpressionMorphBinds>()
         .try_remove::<ExpressionSettings>()
         // Spring bones. `SpringJoints`, `SpringColliders` and

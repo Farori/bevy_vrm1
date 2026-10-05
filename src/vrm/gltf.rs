@@ -73,10 +73,11 @@ use std::sync::{Arc, Mutex};
 
 use crate::prelude::MtoonMaterialPlugin;
 use crate::prelude::{
-    ColliderShape, ConstraintExecutionOrder, ExpressionMorphBinds, ExpressionSettings, Initialized,
-    LookAtProperties, LookAtType, MorphBind, PendingNodeConstraint, RestGlobalTransform,
-    RestTransform, RestWorldTransform, Vrm, VrmBone, VrmConstraintKind, VrmExpressionWeights,
-    VrmHeadOnly, VrmNodeConstraint, VrmNodeIndex, VrmPath, apply_expression_morph_binds,
+    ColliderShape, ConstraintExecutionOrder, EffectiveExpressionWeights, ExpressionMorphBinds,
+    ExpressionSettings, Initialized, LookAtProperties, LookAtType, MorphBind,
+    PendingNodeConstraint, RestGlobalTransform, RestTransform, RestWorldTransform, Vrm, VrmBone,
+    VrmConstraintKind, VrmExpressionWeights, VrmHeadOnly, VrmNodeConstraint, VrmNodeIndex, VrmPath,
+    apply_expression_morph_binds,
 };
 use crate::system_set::VrmSystemSets;
 use crate::vrm::gltf::handler::VrmExtensionHandler;
@@ -181,8 +182,10 @@ impl Plugin for VrmGltfPlugin {
             .register_type::<crate::vrm::spring_bone::SpringJointState>()
             .register_type::<ColliderShape>()
             // The expression property types of `vrma::animation::properties`:
-            // `apply_expression_morph_binds` reads the first three off the root.
+            // `apply_expression_morph_binds` reads the first three off the
+            // root and publishes `EffectiveExpressionWeights` into the fourth.
             .register_type::<VrmExpressionWeights>()
+            .register_type::<EffectiveExpressionWeights>()
             .register_type::<ExpressionMorphBinds>()
             .register_type::<ExpressionSettings>()
             .register_type::<MorphBind>();

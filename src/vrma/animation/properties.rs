@@ -5,9 +5,10 @@
 //! VRMA curves can address the avatar root itself instead of a bone. Expression
 //! weights are animated through [`ExpressionWeightProperty`], which reads and
 //! writes [`VrmExpressionWeights`] on the root; [`apply_expression_morph_binds`]
-//! distributes those weights into the `MorphWeights` of the bound meshes,
-//! honouring `isBinary` and the `overrideMouth` / `overrideBlink` /
-//! `overrideLookAt` rules of the VRM expression spec.
+//! distributes those weights into the `MorphWeights` of the bound meshes and
+//! publishes the final weight of every expression into
+//! [`EffectiveExpressionWeights`], honouring `isBinary` and the `overrideMouth`
+//! / `overrideBlink` / `overrideLookAt` rules of the VRM expression spec.
 //!
 //! # Ownership
 //!
@@ -15,8 +16,9 @@
 //! systems by itself. The loading pipeline that builds the animation graph owns
 //! the lifecycle and **must** `App::register_type` every component below
 //! before a scene that contains them is loaded
-//! ([`VrmExpressionWeights`], [`ExpressionMorphBinds`], [`MorphBind`],
-//! [`MorphBindTable`], [`ExpressionSetting`], [`ExpressionSettings`]), attach
+//! ([`VrmExpressionWeights`], [`EffectiveExpressionWeights`],
+//! [`ExpressionMorphBinds`], [`MorphBind`], [`MorphBindTable`],
+//! [`ExpressionSetting`], [`ExpressionSettings`]), attach
 //! `AnimationTargetId::from_name(&Name::new(VRM_ROOT_TARGET_NAME))` to the VRM
 //! root entity, and add [`apply_expression_morph_binds`] to its schedule.
 
@@ -52,6 +54,21 @@ pub fn vrm_root_animation_target() -> AnimationTargetId {
 #[derive(Component, Reflect, Debug, Clone, Default)]
 #[reflect(Component)]
 pub struct VrmExpressionWeights(pub HashMap<String, f32>);
+
+/// Final weights of all expressions, published by
+/// [`apply_expression_morph_binds`]: every declared expression after its
+/// `isBinary` threshold and the category suppressors
+/// (`overrideMouth` / `overrideBlink` / `overrideLookAt`) resolved to what the
+/// pass actually moves the bound morphs by.
+///
+/// Bindings that are **not** morphs — `materialColorBinds` and
+/// `textureTransformBinds` consumers, for example — read this instead of
+/// [`VrmExpressionWeights`], so a binding applies exactly the weight the
+/// morph targets applied. The map is rewritten on every run of the pass for
+/// every declared expression, even when an expression binds no morph at all.
+#[derive(Component, Reflect, Debug, Clone, Default)]
+#[reflect(Component)]
+pub struct EffectiveExpressionWeights(pub HashMap<String, f32>);
 
 /// Key of one expression inside [`VrmExpressionWeights`].
 #[derive(Reflect, Debug, Clone)]
@@ -265,15 +282,21 @@ fn expression_output_weight(
 ///
 /// Out-of-range bind indices are ignored instead of panicking: a VRMA/VRM file
 /// may bind a morph index a mesh does not have.
+///
+/// The per-expression final weight — the number the bound morph actually
+/// receives — is published into [`EffectiveExpressionWeights`], so a binding
+/// that is not a morph applies exactly the same number. Updated for every
+/// declared expression, even one that binds no morph.
 pub fn apply_expression_morph_binds(
-    roots: Query<(
+    mut roots: Query<(
         &VrmExpressionWeights,
         &ExpressionMorphBinds,
         &ExpressionSettings,
+        Option<&mut EffectiveExpressionWeights>,
     )>,
     mut morphs: Query<&mut MorphWeights>,
 ) {
-    for (weights, binds, settings) in &roots {
+    for (weights, binds, settings, effective) in roots.iter_mut() {
         // Pass 1: output weights, and the accumulated per-category rates.
         let mut outputs: HashMap<&str, f32> = HashMap::default();
         for (name, setting) in settings.0.iter() {
@@ -296,6 +319,33 @@ pub fn apply_expression_morph_binds(
             outputs.get(name).copied().unwrap_or(0.0)
         });
 
+        // The final weight per expression: what the bound morphs receive. A
+        // *binary* expression whose multiplier is below `1.0` is fully
+        // suppressed (`0.0`), because a suppressed blink must not end up
+        // half-closed.
+        let finals: HashMap<_, f32> = outputs
+            .iter()
+            .map(|(name, output)| {
+                let setting = settings.0.get(*name);
+                let is_binary = setting.is_some_and(|setting| setting.is_binary);
+                let category =
+                    setting.map_or(ExpressionCategory::Other, |setting| setting.category);
+                let multiplier = multipliers.get(category);
+                let weight = if is_binary && multiplier < 1.0 {
+                    0.0
+                } else {
+                    *output * multiplier
+                };
+                (*name, weight)
+            })
+            .collect();
+        if let Some(mut effective) = effective {
+            effective.0 = finals
+                .iter()
+                .map(|(name, weight)| ((*name).to_owned(), *weight))
+                .collect();
+        }
+
         // Pass 2: reset every mesh a bind points at.
         let mut touched: Vec<Entity> = binds.0.values().flatten().map(|bind| bind.target).collect();
         touched.sort_unstable();
@@ -310,22 +360,12 @@ pub fn apply_expression_morph_binds(
 
         // Pass 3: accumulate the weighted contributions.
         for (name, bind_list) in binds.0.iter() {
-            let Some(output) = outputs.get(name.as_str()).copied() else {
+            let Some(weight) = finals.get(name.as_str()).copied() else {
                 continue;
             };
-            if output <= 0.0 {
+            if weight <= 0.0 {
                 continue;
             }
-            let setting = settings.0.get(name.as_str());
-            let is_binary = setting.is_some_and(|setting| setting.is_binary);
-            let category = setting.map_or(ExpressionCategory::Other, |setting| setting.category);
-            let multiplier = multipliers.get(category);
-            let weight = if is_binary && multiplier < 1.0 {
-                // A partially suppressed binary expression is fully suppressed.
-                0.0
-            } else {
-                output * multiplier
-            };
             for bind in bind_list {
                 if let Ok(mut morph) = morphs.get_mut(bind.target)
                     && let Some(slot) = morph.weights_mut().get_mut(bind.index)
@@ -343,8 +383,9 @@ mod tests {
 
     use super::*;
     use crate::prelude::{
-        ExpressionMorphBinds as ExportedBinds, ExpressionSetting as ExportedSetting,
-        ExpressionSettings as ExportedSettings, VrmExpressionWeights as ExportedWeights,
+        EffectiveExpressionWeights as ExportedEffective, ExpressionMorphBinds as ExportedBinds,
+        ExpressionSetting as ExportedSetting, ExpressionSettings as ExportedSettings,
+        VrmExpressionWeights as ExportedWeights,
     };
 
     fn setting(
@@ -374,10 +415,12 @@ mod tests {
     struct Model {
         app: App,
         mesh: Entity,
+        root: Entity,
     }
 
-    /// Spawns a root carrying `weights` / `binds` / `settings`, plus a mesh
-    /// with `morphs.len()` morph weights, and runs the bind pass once.
+    /// Spawns a root carrying `weights` / `binds` / `settings` (plus the
+    /// `EffectiveExpressionWeights` the loader seeds), plus a mesh with
+    /// `morphs.len()` morph weights, and runs the bind pass once.
     fn run(
         morph_count: usize,
         weights: &[(&str, f32)],
@@ -389,38 +432,42 @@ mod tests {
             .world_mut()
             .spawn(MorphWeights::new(vec![0.0; morph_count], None).unwrap())
             .id();
-        app.world_mut().spawn((
-            ExportedWeights(
-                weights
-                    .iter()
-                    .map(|(name, weight)| ((*name).to_owned(), *weight))
-                    .collect(),
-            ),
-            ExportedBinds(MorphBindTable(HashMap::from_iter(binds.iter().map(
-                |(name, entries)| {
-                    (
-                        (*name).to_owned(),
-                        entries
-                            .iter()
-                            .map(|(index, weight)| MorphBind {
-                                target: mesh,
-                                index: *index,
-                                weight: *weight,
-                            })
-                            .collect(),
-                    )
-                },
-            )))),
-            ExportedSettings(HashMap::from_iter(
-                settings
-                    .iter()
-                    .map(|(name, setting)| ((*name).to_owned(), setting.clone())),
-            )),
-        ));
+        let root = app
+            .world_mut()
+            .spawn((
+                ExportedWeights(
+                    weights
+                        .iter()
+                        .map(|(name, weight)| ((*name).to_owned(), *weight))
+                        .collect(),
+                ),
+                ExportedBinds(MorphBindTable(HashMap::from_iter(binds.iter().map(
+                    |(name, entries)| {
+                        (
+                            (*name).to_owned(),
+                            entries
+                                .iter()
+                                .map(|(index, weight)| MorphBind {
+                                    target: mesh,
+                                    index: *index,
+                                    weight: *weight,
+                                })
+                                .collect(),
+                        )
+                    },
+                )))),
+                ExportedSettings(HashMap::from_iter(
+                    settings
+                        .iter()
+                        .map(|(name, setting)| ((*name).to_owned(), setting.clone())),
+                )),
+                ExportedEffective::default(),
+            ))
+            .id();
         app.world_mut()
             .run_system_once(apply_expression_morph_binds)
             .unwrap();
-        Model { app, mesh }
+        Model { app, mesh, root }
     }
 
     impl Model {
@@ -430,6 +477,21 @@ mod tests {
                 .get::<MorphWeights>(self.mesh)
                 .unwrap()
                 .weights()
+        }
+
+        /// The final weight the pass published for `name`.
+        fn final_weight(
+            &self,
+            name: &str,
+        ) -> f32 {
+            self.app
+                .world()
+                .get::<EffectiveExpressionWeights>(self.root)
+                .expect("the root carries the published final weights")
+                .0
+                .get(name)
+                .copied()
+                .expect("the expression is published")
         }
     }
 
@@ -719,5 +781,59 @@ mod tests {
         let _: ExportedWeights = VrmExpressionWeights::default();
         let _: ExportedBinds = ExpressionMorphBinds::default();
         let _: ExportedSettings = ExpressionSettings::default();
+        let _: ExportedEffective = EffectiveExpressionWeights::default();
+    }
+
+    /// The published final weight is the weight the bindings consume: the raw
+    /// weight thresholded and de-suppressed, but *before* the per-bind scale
+    /// (`bind.weight`), which is per bind. Here `happy` weighs `0.8`, and its
+    /// only bind scales to `0.8 * 0.5 = 0.4`.
+    #[test]
+    fn the_published_final_weight_matches_the_morph() {
+        let model = run(
+            1,
+            &[("happy", 0.8)],
+            &[("happy", &[(0, 0.5)])],
+            &[("happy", setting(ExpressionCategory::Other, false))],
+        );
+        assert_close(model.weights()[0], 0.4);
+        assert_close(model.final_weight("happy"), 0.8);
+    }
+
+    /// An expression that binds no morph is still published, with its
+    /// thresholded/clamped weight, so a material or UV bind can consume it.
+    #[test]
+    fn an_expression_without_binds_is_still_published() {
+        let model = run(
+            1,
+            &[("happy", 0.8), ("solo", 1.6)],
+            &[("happy", &[(0, 0.5)])],
+            &[("happy", setting(ExpressionCategory::Other, false))],
+        );
+        assert_close(model.final_weight("solo"), 1.0);
+    }
+
+    /// A binary expression suppressed by an overriding expression publishes
+    /// exactly `0.0`, matching the `0.0` the suppressed morph receives.
+    #[test]
+    fn a_suppressed_binary_expression_publishes_zero() {
+        let mut blocking = setting(ExpressionCategory::Other, false);
+        blocking.override_mouth = ExpressionOverrideType::Block;
+        blocking.override_blink = ExpressionOverrideType::Block;
+        let model = run(
+            1,
+            &[("happy", 1.0), ("aa", 0.7), ("blink", 1.0)],
+            &[("aa", &[(0, 1.0)])],
+            &[
+                ("happy", blocking),
+                ("aa", setting(ExpressionCategory::Mouth, false)),
+                ("blink", setting(ExpressionCategory::Blink, true)),
+            ],
+        );
+        // `aa` is throttled; `blink` is a suppressed binary expression.
+        assert_close(model.weights()[0], 0.0);
+        assert_close(model.final_weight("aa"), 0.0);
+        assert_close(model.final_weight("blink"), 0.0);
+        assert_close(model.final_weight("happy"), 1.0);
     }
 }
