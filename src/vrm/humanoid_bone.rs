@@ -64,8 +64,8 @@ impl HumanoidBoneRegistry {
 ///
 /// [`crate::vrm::gltf::VrmGltfPlugin`] registers the same types itself, because
 /// the scene spawn pipeline drops any component whose type is not registered
-/// (`ReflectComponent::apply_or_insert_mapped`). Adding [`BonesPlugin`] twice is
-/// a no-op.
+/// (`ReflectComponent::apply_or_insert_mapped`). [`register_bone_components`]
+/// guards against the duplicate when an app holds both plugins.
 pub(super) struct VrmHumanoidBonePlugin;
 
 impl Plugin for VrmHumanoidBonePlugin {
@@ -215,8 +215,26 @@ pub(crate) fn insert_bone_holders(
 /// [`crate::vrm::gltf::VrmGltfPlugin`] calls this because the
 /// pipeline writes both families into the scene asset, and the scene spawn
 /// pipeline drops any component whose type is not registered
-/// (`ReflectComponent::apply_or_insert_mapped`). [`VrmPlugin`] registers them
-/// too, and adding [`BonesPlugin`] twice is a no-op.
+/// (`ReflectComponent::apply_or_insert_mapped`). [`VrmPlugin`] calls it too, so
+/// an app holding both plugins reaches this twice. [`BonesPlugin`] is a unique
+/// plugin and `add_plugins` panics on a duplicate, hence the guard.
 pub(crate) fn register_bone_components(app: &mut App) {
-    app.add_plugins(BonesPlugin);
+    if !app.is_plugin_added::<BonesPlugin>() {
+        app.add_plugins(BonesPlugin);
+    }
+}
+
+#[cfg(test)]
+mod plugin_tests {
+    use super::*;
+
+    /// `VrmPlugin + VrmGltfPlugin` both register the bone types, which panicked
+    /// with "plugin was already added in application" and broke every example.
+    #[test]
+    fn test_register_bone_components_is_idempotent() {
+        let mut app = App::new();
+        register_bone_components(&mut app);
+        register_bone_components(&mut app);
+        assert!(app.is_plugin_added::<BonesPlugin>());
+    }
 }
