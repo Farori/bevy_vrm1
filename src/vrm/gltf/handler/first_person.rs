@@ -126,6 +126,27 @@ pub(crate) fn process_primitive(
     };
     let (body, head) = parts;
 
+    // `classify` decides per *vertex*, but `build_submesh` sends a whole triangle
+    // to the head as soon as any of its vertices is a head vertex. The two can
+    // disagree and leave one half empty. An empty mesh must never be added as an
+    // asset: bevy's mesh allocator extracts it, skips the zero-length allocation,
+    // then tries to copy into the missing slot and logs a use-after-free
+    // (`bevy_render::slab_allocator`).
+    let body_vertices = body.count_vertices();
+    let head_vertices = head.count_vertices();
+    if body_vertices == 0 || head_vertices == 0 {
+        // Keep bevy's own mesh and classify the primitive as a whole: no head
+        // triangle means it is visible in both views, no body triangle means it
+        // is head-only.
+        let class = if head_vertices == 0 {
+            AutoClass::Both
+        } else {
+            AutoClass::ThirdPersonOnly
+        };
+        state.first_person.classes.insert(key, class);
+        return;
+    }
+
     // The body half replaces the primitive bevy is about to build.
     *user_mesh = Some(body);
 
@@ -185,16 +206,7 @@ fn classify(
         return Some(AutoClass::Both);
     }
     let (joints, weights) = read_skin(gltf_primitive, buffer_data)?;
-    let head_vertex: Vec<bool> = joints
-        .iter()
-        .zip(&weights)
-        .map(|(joint, weight)| {
-            joint
-                .iter()
-                .zip(weight)
-                .any(|(slot, w)| *w > 0.0 && head_slots.contains(slot))
-        })
-        .collect();
+    let head_vertex = head_vertex_flags(&joints, &weights, &head_slots);
     Some(
         match head_vertex.iter().filter(|is_head| **is_head).count() {
             0 => AutoClass::Both,
@@ -251,6 +263,49 @@ fn read_skin<'r>(
         return None;
     }
     Some((joints, weights))
+}
+
+/// The per-vertex head flag, computed the same way for [`classify`] and
+/// [`split`] so the two never disagree.
+fn head_vertex_flags(
+    joints: &[[u16; 4]],
+    weights: &[[f32; 4]],
+    head_slots: &HashSet<u16>,
+) -> Vec<bool> {
+    joints
+        .iter()
+        .zip(weights)
+        .map(|(joint, weight)| is_head_vertex(joint, weight, head_slots))
+        .collect()
+}
+
+/// Whether the head subtree holds the **majority** of this vertex's influence.
+///
+/// The specification (`firstPerson.md`, "MeshAnnotation.Auto Algorithm") only
+/// says a vertex "contains the weight of Head bone", names no threshold and
+/// prescribes no method for the split, so a threshold is the library's choice;
+/// the majority rule is admissible and is chosen to match the algorithm's
+/// stated intent — hide what blocks the first-person view (the face, head and
+/// hair), not the neck. Reading "contains" as "any weight above zero" swallows
+/// the neck of a model whose neck skin blends toward the head
+/// (`ANIMA_MA_PATCH.md`, patch 2): a `VRoid` 1.x export carries a smooth
+/// head-weight gradient (measured 0.03 at the throat up to 0.87 under the jaw),
+/// so a throat triangle whose neck joint dominates is classified head-side,
+/// moved to the third-person-only layer and disappears from the first-person
+/// view. Requiring the head subtree to hold more than half of the vertex's
+/// total influence puts the split at the anatomical head on every model, and
+/// leaves a dedicated neck mesh weighted to the neck bone alone visible.
+fn is_head_vertex(
+    joint: &[u16; 4],
+    weight: &[f32; 4],
+    head_slots: &HashSet<u16>,
+) -> bool {
+    let total: f32 = weight.iter().sum();
+    let head: f32 = (0..4)
+        .filter(|&k| head_slots.contains(&joint[k]))
+        .map(|k| weight[k])
+        .sum();
+    head * 2.0 > total
 }
 
 /// Per-vertex data of one primitive, plus the per-vertex head flag.
@@ -312,16 +367,7 @@ fn split(
         })
         .collect();
 
-    let head_vertex: Vec<bool> = joints
-        .iter()
-        .zip(&weights)
-        .map(|(joint, weight)| {
-            joint
-                .iter()
-                .zip(weight)
-                .any(|(slot, w)| *w > 0.0 && head_slots.contains(slot))
-        })
-        .collect();
+    let head_vertex = head_vertex_flags(&joints, &weights, &head_slots);
 
     let data = PrimitiveData {
         topology,
@@ -754,6 +800,45 @@ mod tests {
         assert!(build_submesh(&data2, false).is_none());
         // The fixture is still usable, so the test does not leak a borrow.
         assert_eq!(fixture.morph_targets.len(), 1);
+        success!()
+    }
+
+    /// `classify` counts head vertices one vertex at a time, but `build_submesh`
+    /// sends a whole triangle to the head as soon as *any* of its vertices is a
+    /// head vertex. When every triangle touches a head vertex the body half comes
+    /// out empty, and adding that empty mesh as an asset once made bevy's mesh
+    /// allocator log a use-after-free. This pins the premise of the guard in
+    /// `process_primitive`.
+    #[test]
+    fn an_all_head_primitive_has_an_empty_body_half() -> TestResult {
+        let fixture = Fixture::new();
+        let mut data = fixture.primitive();
+        data.head_vertex = vec![true; 6];
+
+        let body = build_submesh(&data, false).expect("the topology is a strip");
+        assert_eq!(body.count_vertices(), 0, "the body half is empty");
+        let head = build_submesh(&data, true).expect("the topology is a strip");
+        assert_eq!(head.count_vertices(), 6, "the head half keeps every vertex");
+        success!()
+    }
+
+    /// The `ANIMA_MA_PATCH.md` majority rule: a vertex the head subtree only
+    /// partly influences (the throat on a model whose neck skin blends toward
+    /// the head) is not head-side, so its geometry stays visible in first
+    /// person. Reading the rule as "any head weight at all" hid the neck of
+    /// every `VRoid` export except the models whose neck is a dedicated mesh.
+    #[test]
+    fn a_neck_dominant_vertex_stays_visible() -> TestResult {
+        let head_slots: HashSet<u16> = [1u16].into_iter().collect();
+        // Slot 1 is the head joint, slot 0 the neck. v0 is the throat (0.3 head
+        // / 0.7 neck), v1 the jaw (0.8 head / 0.2 neck).
+        let joints = [[1, 0, 0, 0], [1, 0, 0, 0]];
+        let weights = [[0.3, 0.7, 0.0, 0.0], [0.8, 0.2, 0.0, 0.0]];
+        assert_eq!(
+            head_vertex_flags(&joints, &weights, &head_slots),
+            vec![false, true],
+            "only the head-dominant vertex is head-side; the throat stays visible"
+        );
         success!()
     }
 }
