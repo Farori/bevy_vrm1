@@ -1,13 +1,16 @@
 //! This module inserts [`SceneRoot`] and VRMA-related components from the loaded [`VrmaHandle`].
 
 use crate::error::vrm_error;
-use crate::vrm::Initialized;
+use crate::system_param::prelude::*;
 use crate::vrm::humanoid_bone::HumanoidBoneRegistry;
+use crate::vrm::{Initialized, RestGlobalTransform, RestTransform, RestWorldTransform};
 use crate::vrma::animation::animation_graph::RequestUpdateAnimationGraph;
 use crate::vrma::animation::expressions::VrmaExpressionRegistry;
 use crate::vrma::gltf::extensions::VrmaExtensions;
 use crate::vrma::loader::VrmaAsset;
-use crate::vrma::{VrmAnimationClipHandle, Vrma, VrmaDuration, VrmaHandle, VrmaPath};
+use crate::vrma::{
+    RetargetSource, VrmAnimationClipHandle, Vrma, VrmaDuration, VrmaHandle, VrmaPath,
+};
 use bevy::gltf::GltfNode;
 use bevy::platform::collections::HashSet;
 use bevy::prelude::*;
@@ -21,7 +24,10 @@ impl Plugin for VrmaInitializePlugin {
         &self,
         app: &mut App,
     ) {
-        app.add_systems(Update, (spawn_vrma, trigger_loaded));
+        app.add_systems(
+            Update,
+            (spawn_vrma, request_initialize_vrma, trigger_loaded),
+        );
     }
 }
 
@@ -98,6 +104,48 @@ fn spawn_vrma(
                 &vrma.gltf.nodes,
             ),
         ));
+    }
+}
+
+/// Stamps [`Initialized`] on a `.vrma` entity once its source rig has spawned,
+/// and captures the source rig's rest pose.
+///
+/// A `.vrm` is initialized while it loads, so the avatar root already carries the
+/// marker and the pipeline writes its rest transforms into the scene. A `.vrma`
+/// still builds its bones through the scene it instantiates and nothing writes
+/// those components, so without this the VRMA retarget finds every source bone
+/// without a `(RestTransform, RestGlobalTransform)` pair, silently moves no curve
+/// and no `.vrma` ever plays.
+fn request_initialize_vrma(
+    mut commands: Commands,
+    models: Query<(Entity, &HumanoidBoneRegistry), (With<Vrma>, Without<Initialized>)>,
+    transforms: Query<(&Transform, &GlobalTransform)>,
+    searcher: ChildSearcher,
+) {
+    for (root, registry) in models.iter() {
+        if !searcher.has_been_spawned_all_bones(root, registry) {
+            continue;
+        }
+        // The application placement, captured together with the bones' rests:
+        // VRM and VRMA may initialize under different world transforms.
+        if let Ok((_, global)) = transforms.get(root) {
+            commands.entity(root).insert(RestWorldTransform(*global));
+        }
+        for (bone, name) in registry.iter() {
+            let Some(entity) = searcher.find_from_name(root, name) else {
+                continue;
+            };
+            let Ok((tf, gtf)) = transforms.get(entity) else {
+                continue;
+            };
+            commands.entity(entity).insert((
+                bone.clone(),
+                RestTransform(*tf),
+                RestGlobalTransform(*gtf),
+                RetargetSource,
+            ));
+        }
+        commands.entity(root).insert(Initialized);
     }
 }
 
@@ -197,5 +245,52 @@ mod tests {
         let requests = &app.world().resource::<GraphRequests>().0;
         assert_eq!(requests.len(), 2);
         assert_ne!(requests[0], requests[1]);
+    }
+
+    /// The regression that stopped every `.vrma` from playing: nothing stamped
+    /// `Initialized` on a `.vrma` entity and nothing captured its source rig's
+    /// rest transforms, so `trigger_loaded` never fired and the retarget found
+    /// every source bone without a `(RestTransform, RestGlobalTransform)` pair.
+    #[test]
+    fn a_vrma_is_initialized_and_its_rests_are_captured_once_its_bones_are_spawned() {
+        use crate::vrm::VrmBone;
+
+        let mut app = App::new();
+        app.add_systems(Update, request_initialize_vrma);
+        let registry =
+            HumanoidBoneRegistry::from_pairs([(VrmBone("hips".to_owned()), Name::new("hips"))]);
+        let vrma = app
+            .world_mut()
+            .spawn((
+                Vrma,
+                registry,
+                Transform::default(),
+                GlobalTransform::default(),
+            ))
+            .id();
+
+        // The source rig has not arrived yet: the marker must not be stamped.
+        app.update();
+        assert!(app.world().get::<Initialized>(vrma).is_none());
+
+        let hips = app
+            .world_mut()
+            .spawn((
+                Name::new("hips"),
+                Transform::from_xyz(0.0, 1.0, 0.0),
+                GlobalTransform::from_xyz(0.0, 1.0, 0.0),
+                ChildOf(vrma),
+            ))
+            .id();
+        app.update();
+        assert!(
+            app.world().get::<Initialized>(vrma).is_some(),
+            "with every bone spawned the VRMA is initialized and the graph can be built"
+        );
+        assert!(
+            app.world().get::<RestTransform>(hips).is_some()
+                && app.world().get::<RestGlobalTransform>(hips).is_some(),
+            "the source bone's rest pose is captured, or the retarget moves no curve"
+        );
     }
 }

@@ -59,6 +59,15 @@ impl HumanoidBoneRegistry {
     }
 }
 
+#[cfg(test)]
+impl HumanoidBoneRegistry {
+    /// Builds a registry from `(bone, node name)` pairs, so tests do not have to
+    /// materialize `GltfNode` assets just to exercise the bone search.
+    pub(crate) fn from_pairs(pairs: impl IntoIterator<Item = (VrmBone, Name)>) -> Self {
+        Self(pairs.into_iter().collect())
+    }
+}
+
 /// Registers the bone markers and the bone-entity holders for apps that load a
 /// VRM without [`VrmGltfPlugin`](crate::prelude::VrmGltfPlugin).
 ///
